@@ -17,6 +17,11 @@ from .nerf import (
     get_nerf_dataset,
     get_nerf_dataset_cls,
 )
+from .timeseries import (
+    TIMESERIES_DATASET_MAPPING,
+    get_timeseries_dataset,
+    get_timeseries_dataset_cls,
+)
 
 DATASET_CACHE_DIR = MACHOP_CACHE_DIR / "dataset"
 
@@ -41,6 +46,8 @@ def get_dataset_info(name: str):
         return get_physical_dataset_cls(name).info
     elif name in NERF_DATASET_MAPPING:
         return get_nerf_dataset_cls(name).info
+    elif name in TIMESERIES_DATASET_MAPPING:
+        return get_timeseries_dataset_cls(name).info
     else:
         raise ValueError(f"Dataset {name} is not supported")
 
@@ -98,6 +105,9 @@ def get_dataset(
             load_from_cache_file=load_from_cache_file,
             auto_setup=auto_setup,
         )
+    elif name in TIMESERIES_DATASET_MAPPING:
+        path = DATASET_CACHE_DIR / name
+        dataset = get_timeseries_dataset(name, split, custom_path=custom_path)
     else:
         raise ValueError(f"Dataset {name} is not supported")
     return dataset
@@ -109,6 +119,7 @@ AVAILABLE_DATASETS = (
     + list(TOY_DATASET_MAPPING.keys())
     + list(PHYSICAL_DATASET_MAPPING.keys())
     + list(NERF_DATASET_MAPPING.keys())
+    + list(TIMESERIES_DATASET_MAPPING.keys())
 )
 
 

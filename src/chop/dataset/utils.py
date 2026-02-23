@@ -73,6 +73,10 @@ class MaseDatasetInfo:
     # nerf
     nerf_config: dict = None
 
+    # time series
+    time_series_forecasting: bool = False
+    prediction_length: int = None
+
     def __post_init__(self):
         self.dataset_source = (
             DatasetSource(self.dataset_source)
@@ -96,6 +100,8 @@ class MaseDatasetInfo:
             "image_size",
             "num_features",
             "nerf_config",
+            "time_series_forecasting",
+            "prediction_length",
         }
 
     @property
@@ -128,6 +134,8 @@ def add_dataset_info(
     image_size: tuple[int] = None,
     num_features: int = None,
     nerf_config: dict = None,
+    time_series_forecasting: bool = False,
+    prediction_length: int = None,
     data_collator_cls=None,
 ):
     """
@@ -164,6 +172,8 @@ def add_dataset_info(
             image_size=image_size,
             num_features=num_features,
             nerf_config=nerf_config,
+            time_series_forecasting=time_series_forecasting,
+            prediction_length=prediction_length,
             data_collator_cls=data_collator_cls,
         )
 
