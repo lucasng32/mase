@@ -56,6 +56,9 @@ MASE_IMPLICIT_FUNCS = [
     "cumsum",  # Added for Wave2Vec
     "flip",  # Added for Wave2Vec
     "repeat",  # Added for Wave2Vec
+    "pow", # Added for chronos2
+    "mean", # Added for chronos2
+    "float", # Added for chronos2
 ]
 
 MASE_MODULE_RELATED_FUNCS = [
