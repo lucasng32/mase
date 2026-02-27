@@ -171,7 +171,11 @@ func_data = {
     # https://pytorch.org/docs/stable/generated/torch.log.html
     "log": {"input": "data_in"},
     # https://pytorch.org/docs/stable/generated/torch.mean.html
-    "mean": {"input": "data_in"},
+    "mean": {
+        "input": "data_in",
+        "dim": "config",
+        "keepdim": "config",
+    },
     # https://pytorch.org/docs/stable/generated/torch.arange.html
     "arange": {
         "start": "config",
@@ -318,6 +322,32 @@ func_data = {
     "invert": {  # Added for Wave2Vec
         "input": "data_in",
     },
+    "nanmean": { # Added for chronos2
+        "input": "data_in",
+        "dim": "config",
+        "keepdim": "config",
+        "dtype": "config",
+    },
+    "to": { # Added for chronos2
+        "input": "data_in",
+        "device": "config",
+        "dtype": "config",
+        "non_blocking": "config",
+        "copy": "config",
+        "memory_format": "config",
+    },  
+    "nan_to_num": { # Added for chronos2
+        "input": "data_in",
+        "nan": "config",
+        "posinf": "config",
+        "neginf": "config",
+    },
+    "sinh": {"input": "data_in"}, # Added for chronos2
+    "sum": { # Added for chronos2
+        "input": "data_in", 
+        "dim": "config", 
+        "keepdim": "config"
+    }, 
 }
 
 module_data = {
@@ -491,6 +521,30 @@ method_data = {
     "int": {"memory_format": "config"},
     "_assert": {"input": "data_in"},
     "flatten": {"start_dim": "config", "end_dim": "config"},
+    "square": {}, # Added for chronos2
+    "nanmean" : { # Added for chronos2
+        "dim": "config",
+        "keepdim": "config",
+        "dtype": "config",
+    }, 
+    "sqrt": {}, # Added for chronos2
+    "unfold": { # Added for chronos2
+        "input": "data_in",
+        "dimension": "config",
+        "size": "config",
+        "step": "config",
+    },
+    "expand_as": {"other": "data_in"}, # Added for chronos2
+    "div": {"other": "data_in"}, # Added for chronos2
+    "pow": {"exponent": "config"}, # Added for chronos2
+    "mean": {
+        "dim": "config",
+        "keepdim": "config",
+        "dtype": "config",
+    }, # Added for chronos2
+    "float": {"memory_format": "config"}, # Added for chronos2
+    "cos": {}, # Added for chronos2
+    "sin": {}, # Added for chronos2
 }
 
 # ----------------------------------------------------------
@@ -623,6 +677,8 @@ def _annotate_arg_metadata(
 
     # * Handle kwargs
     for k, v in kwargs.items():
+        if k not in func_data:
+            func_data[k] = "config" # assume config
         if func_data[k] == "data_in":
             # rename this to mase data_in_number
             shape = get_shape(v)

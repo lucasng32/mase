@@ -59,6 +59,13 @@ MASE_IMPLICIT_FUNCS = [
     "pow", # Added for chronos2
     "mean", # Added for chronos2
     "float", # Added for chronos2
+    "square", # Added for chronos2
+    "sqrt", # Added for chronos2
+    "unfold", # Added for chronos2
+    "sum", # Added for chronos2
+    "div", # Added for chronos2
+    "cos", # Added for chronos2
+    "sin", # Added for chronos2
 ]
 
 MASE_MODULE_RELATED_FUNCS = [
