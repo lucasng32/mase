@@ -6,7 +6,7 @@
 from dataclasses import dataclass
 
 import torch
-from einops import rearrange
+# from einops import rearrange
 from torch import nn
 from transformers.activations import ACT2FN
 from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS
@@ -258,11 +258,20 @@ class MHA(nn.Module):
 
         def shape(states: torch.Tensor) -> torch.Tensor:
             """(batch, seq_len, inner_dim) -> (batch, n_heads, seq_len, kv_proj_dim)"""
-            return rearrange(states, "b s (h d) -> b h s d", h=self.n_heads, s=seq_length, d=self.kv_proj_dim)
+            # return rearrange(states, "b s (h d) -> b h s d", h=self.n_heads, s=seq_length, d=self.kv_proj_dim)
+            batch_size = states.shape[0]
+            seq_length = states.shape[1]
+            states = states.view(batch_size, seq_length, self.n_heads, self.kv_proj_dim)
+            return states.transpose(1, 2)
 
         def unshape(states: torch.Tensor) -> torch.Tensor:
             """(batch, n_heads, seq_len, kv_proj_dim) -> (batch, seq_len, inner_dim)"""
-            return rearrange(states, "b h s d -> b s (h d)", h=self.n_heads, s=seq_length, d=self.kv_proj_dim)
+            # return rearrange(states, "b h s d -> b s (h d)", h=self.n_heads, s=seq_length, d=self.kv_proj_dim)
+            batch_size = states.shape[0]
+            seq_length = states.shape[2] 
+            states = states.transpose(1, 2)
+            return states.reshape(batch_size, seq_length, -1)
+            
 
         # Construct query states
         query_states = shape(self.q(hidden_states))
@@ -354,14 +363,16 @@ class GroupSelfAttention(nn.Module):
         self, hidden_states: torch.Tensor, attention_mask: torch.Tensor, output_attentions: bool = False
     ) -> AttentionOutput:
         # flip time and batch axes because attention operates along dim=-2
-        hidden_states = rearrange(hidden_states, "batch time d -> time batch d")
+        # hidden_states = rearrange(hidden_states, "batch time d -> time batch d")
+        hidden_states = hidden_states.transpose(0, 1)
         normed_hidden_states = self.layer_norm(hidden_states)
         attention_output: AttentionOutput = self.self_attention(
             normed_hidden_states, mask=attention_mask, output_attentions=output_attentions
         )
         hidden_states = hidden_states + self.dropout(attention_output[0])
         # flip time and batch axes back to their original position
-        hidden_states = rearrange(hidden_states, "time batch d -> batch time d")
+        #hidden_states = rearrange(hidden_states, "time batch d -> batch time d")
+        hidden_states = hidden_states.transpose(0, 1)
 
         return AttentionOutput(hidden_states=hidden_states, attn_weights=attention_output.attn_weights)
 

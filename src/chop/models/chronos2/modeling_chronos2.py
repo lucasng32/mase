@@ -9,7 +9,7 @@ from typing import cast
 
 import torch
 import torch.nn as nn
-from einops import rearrange, repeat
+# from einops import rearrange, repeat
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
@@ -101,7 +101,7 @@ class Chronos2Encoder(nn.Module):
     def _expand_and_invert_time_attention_mask(
         attention_mask: torch.Tensor, floating_type: torch.dtype
     ) -> torch.Tensor:
-        assert attention_mask.ndim == 2, "attention_mask must have shape (batch, seq_len)"
+        #assert attention_mask.ndim == 2, "attention_mask must have shape (batch, seq_len)"
 
         # Add new dims for attention heads and q_len
         attention_mask = attention_mask[:, None, None, :]
@@ -123,12 +123,14 @@ class Chronos2Encoder(nn.Module):
         # tokens from the same group which are also not masked in time
         group_time_mask = torch.einsum("qb, bt -> qbt", group_mask, attention_mask)
 
-        if torch.is_floating_point(group_time_mask):
-            # this ensures that mixed precision training does not overflow
-            floating_type = group_time_mask.dtype
+        # if torch.is_floating_point(group_time_mask):
+        #     # this ensures that mixed precision training does not overflow
+        #     floating_type = group_time_mask.dtype
 
         # reshape mask to shape of attention scores
-        group_time_mask = rearrange(group_time_mask, "q b t -> t 1 q b")
+        # group_time_mask = rearrange(group_time_mask, "q b t -> t 1 q b")
+        group_time_mask = group_time_mask.permute(2, 0, 1)
+        group_time_mask = group_time_mask.unsqueeze(1)
         group_time_mask = (1.0 - group_time_mask) * torch.finfo(floating_type).min
 
         return group_time_mask
@@ -413,14 +415,27 @@ class Chronos2Model(PreTrainedModel):
         # scaled by model's context length = [-C, -(C-1), ..., -1] / context_length
         final_context_length = num_context_patches * self.chronos_config.input_patch_size
         context_time_enc = torch.arange(start=-final_context_length, end=0, device=self.device, dtype=torch.float32)
+        # context_time_enc = (
+        #     repeat(
+        #         context_time_enc,
+        #         "(n p) -> b n p",
+        #         b=batch_size,
+        #         n=num_context_patches,
+        #         p=self.chronos_config.input_patch_size,
+        #     )
+        #     .div(cast(int, self.chronos_config.time_encoding_scale))
+        #     .to(self.dtype)
+        # )
+
+        
+        context_time_enc = context_time_enc.view(num_context_patches, self.chronos_config.input_patch_size)
+        
+        context_time_enc = context_time_enc.unsqueeze(0)
+        
+        context_time_enc = context_time_enc.expand_as(patched_context)
+        
         context_time_enc = (
-            repeat(
-                context_time_enc,
-                "(n p) -> b n p",
-                b=batch_size,
-                n=num_context_patches,
-                p=self.chronos_config.input_patch_size,
-            )
+            context_time_enc
             .div(cast(int, self.chronos_config.time_encoding_scale))
             .to(self.dtype)
         )
@@ -468,11 +483,19 @@ class Chronos2Model(PreTrainedModel):
             #         [future_covariates_mask, torch.zeros(padding_shape).to(future_covariates_mask)], dim=-1
             #     )
 
-            patched_future_covariates = rearrange(
-                future_covariates, "b (n p) -> b n p", n=num_output_patches, p=output_patch_size
+            # patched_future_covariates = rearrange(
+            #     future_covariates, "b (n p) -> b n p", n=num_output_patches, p=output_patch_size
+            # )
+            # patched_future_covariates_mask = rearrange(
+            #     future_covariates_mask, "b (n p) -> b n p", n=num_output_patches, p=output_patch_size
+            # )
+
+            patched_future_covariates = future_covariates.view(
+                batch_size, num_output_patches, output_patch_size
             )
-            patched_future_covariates_mask = rearrange(
-                future_covariates_mask, "b (n p) -> b n p", n=num_output_patches, p=output_patch_size
+            
+            patched_future_covariates_mask = future_covariates_mask.view(
+                batch_size, num_output_patches, output_patch_size
             )
         else:
             patched_future_covariates = torch.zeros(
@@ -486,14 +509,26 @@ class Chronos2Model(PreTrainedModel):
         # scaled by model's context length = [0, 1, ..., h-1] / context_length
         final_future_length = num_output_patches * output_patch_size
         future_time_enc = torch.arange(start=0, end=final_future_length, device=self.device, dtype=torch.float32)
+        # future_time_enc = (
+        #     repeat(
+        #         future_time_enc,
+        #         "(n p) -> b n p",
+        #         b=batch_size,
+        #         n=num_output_patches,
+        #         p=output_patch_size,
+        #     )
+        #     .div(cast(int, self.chronos_config.time_encoding_scale))
+        #     .to(self.dtype)
+        # )
+
+        future_time_enc = future_time_enc.view(num_output_patches, output_patch_size)
+
+        future_time_enc = future_time_enc.unsqueeze(0)
+
+        future_time_enc = future_time_enc.expand_as(patched_future_covariates)
+        
         future_time_enc = (
-            repeat(
-                future_time_enc,
-                "(n p) -> b n p",
-                b=batch_size,
-                n=num_output_patches,
-                p=output_patch_size,
-            )
+            future_time_enc
             .div(cast(int, self.chronos_config.time_encoding_scale))
             .to(self.dtype)
         )
@@ -536,17 +571,26 @@ class Chronos2Model(PreTrainedModel):
                 [future_target_mask, torch.zeros(padding_shape).to(future_target_mask)], dim=-1
             )
 
-        quantiles = rearrange(self.quantiles, "num_quantiles -> 1 num_quantiles 1")
+        # quantiles = rearrange(self.quantiles, "num_quantiles -> 1 num_quantiles 1")
+        # quantile_loss = 2 * torch.abs(
+        #     (future_target - quantile_preds) * ((future_target <= quantile_preds).float() - quantiles)
+        # )
+        # inv_future_covariate_mask = 1 - rearrange(
+        #     patched_future_covariates_mask,
+        #     "b n p -> b 1 (n p)",
+        #     b=batch_size,
+        #     n=num_output_patches,
+        #     p=output_patch_size,
+        # )
+
+        quantiles = self.quantiles.view(1, -1, 1)
+        
         quantile_loss = 2 * torch.abs(
             (future_target - quantile_preds) * ((future_target <= quantile_preds).float() - quantiles)
         )
-        inv_future_covariate_mask = 1 - rearrange(
-            patched_future_covariates_mask,
-            "b n p -> b 1 (n p)",
-            b=batch_size,
-            n=num_output_patches,
-            p=output_patch_size,
-        )
+        
+        inv_future_covariate_mask = 1 - patched_future_covariates_mask.view(batch_size, 1, -1)
+
         # the first components masks any missing targets and the second component masks known future values
         loss_mask = future_target_mask.float() * inv_future_covariate_mask
         loss = quantile_loss * loss_mask
@@ -714,18 +758,29 @@ class Chronos2Model(PreTrainedModel):
             output_attentions=output_attentions,
         )
         hidden_states: torch.Tensor = encoder_outputs[0]
-        assert hidden_states.shape == (batch_size, num_context_patches + 1 + num_output_patches, self.model_dim)
+        #assert hidden_states.shape == (batch_size, num_context_patches + 1 + num_output_patches, self.model_dim)
 
         # slice the last num_output_patches hidden states to be input into the output_patch_embedding
         forecast_embeds = hidden_states[:, -num_output_patches:]
         quantile_preds: torch.Tensor = self.output_patch_embedding(forecast_embeds)
-        quantile_preds = rearrange(
-            quantile_preds,
-            "b n (q p) -> b q (n p)",
-            n=num_output_patches,
-            q=self.num_quantiles,
-            p=self.chronos_config.output_patch_size,
+        # quantile_preds = rearrange(
+        #     quantile_preds,
+        #     "b n (q p) -> b q (n p)",
+        #     n=num_output_patches,
+        #     q=self.num_quantiles,
+        #     p=self.chronos_config.output_patch_size,
+        # )
+
+        quantile_preds = quantile_preds.view(
+            batch_size, 
+            num_output_patches, 
+            self.num_quantiles, 
+            self.chronos_config.output_patch_size
         )
+        
+        quantile_preds = quantile_preds.permute(0, 2, 1, 3)
+        
+        quantile_preds = quantile_preds.reshape(batch_size, self.num_quantiles, -1)
 
         loss = (
             self._compute_loss(
@@ -741,20 +796,28 @@ class Chronos2Model(PreTrainedModel):
         )
 
         # Unscale predictions
-        quantile_preds = rearrange(
-            quantile_preds,
-            "b q h -> b (q h)",
-            b=batch_size,
-            q=self.num_quantiles,
-            h=num_output_patches * self.chronos_config.output_patch_size,
-        )
+        # quantile_preds = rearrange(
+        #     quantile_preds,
+        #     "b q h -> b (q h)",
+        #     b=batch_size,
+        #     q=self.num_quantiles,
+        #     h=num_output_patches * self.chronos_config.output_patch_size,
+        # )
+        # quantile_preds = self.instance_norm.inverse(quantile_preds, loc_scale)
+        # quantile_preds = rearrange(
+        #     quantile_preds,
+        #     "b (q h) -> b q h",
+        #     q=self.num_quantiles,
+        #     h=num_output_patches * self.chronos_config.output_patch_size,
+        # )
+
+        h_dim = num_output_patches * self.chronos_config.output_patch_size
+        
+        quantile_preds = quantile_preds.view(batch_size, self.num_quantiles * h_dim)
+        
         quantile_preds = self.instance_norm.inverse(quantile_preds, loc_scale)
-        quantile_preds = rearrange(
-            quantile_preds,
-            "b (q h) -> b q h",
-            q=self.num_quantiles,
-            h=num_output_patches * self.chronos_config.output_patch_size,
-        )
+        
+        quantile_preds = quantile_preds.view(batch_size, self.num_quantiles, h_dim)
 
         return Chronos2Output(
             loss=loss,
