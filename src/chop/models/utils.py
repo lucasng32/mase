@@ -38,6 +38,7 @@ class ModelTaskType(Enum):
     PHYSICAL = "physical"
     NERF = "nerf"
     SPEECH = "speech"
+    TIMESERIES = "timeseries"
 
 
 @dataclass

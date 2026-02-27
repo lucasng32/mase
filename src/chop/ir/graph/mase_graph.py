@@ -114,7 +114,7 @@ def trace_torch_module(
     model.load_state_dict(state_dict)
 
     # * HuggingFace model
-    if isinstance(model, PreTrainedModel):
+    if isinstance(model, PreTrainedModel) and hf_input_names is not None:
         tracer_cls = HFTracer
 
         if custom_ops is not None:

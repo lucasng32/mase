@@ -26,6 +26,8 @@ from .layers import (
     ResidualBlock,
     TimeSelfAttention,
 )
+from chop.models.utils import register_mase_model, register_mase_checkpoint
+from .pipeline import Chronos2Pipeline
 
 
 @dataclass
@@ -194,6 +196,13 @@ class Chronos2Output(ModelOutput):
     enc_time_self_attn_weights: tuple[torch.Tensor, ...] | None = None
     enc_group_self_attn_weights: tuple[torch.Tensor, ...] | None = None
 
+
+@register_mase_model(
+    "chronos-2",
+    checkpoints=["chronos-2"],
+    model_source="manual",
+    task_type="timeseries",
+)
 class Chronos2Model(PreTrainedModel):
     config_class = Chronos2CoreConfig  # type: ignore[assignment]
     _supports_long_horizon: bool = True
@@ -380,9 +389,9 @@ class Chronos2Model(PreTrainedModel):
 
         batch_size, context_length = context.shape
         # truncate context if it's longer than model's context length
-        if context_length > self.chronos_config.context_length:
-            context = context[..., -self.chronos_config.context_length :]
-            context_mask = context_mask[..., -self.chronos_config.context_length :]
+        # if context_length > self.chronos_config.context_length:
+        #     context = context[..., -self.chronos_config.context_length :]
+        #     context_mask = context_mask[..., -self.chronos_config.context_length :]
 
         # scaling
         context, loc_scale = self.instance_norm(context)
@@ -447,17 +456,17 @@ class Chronos2Model(PreTrainedModel):
                 )
 
             # add padding if the length of future_covariates is not an integer multiple of output_patch_size
-            if num_output_patches * output_patch_size > future_covariates.shape[-1]:
-                padding_shape = (
-                    *future_covariates.shape[:-1],
-                    num_output_patches * output_patch_size - future_covariates.shape[-1],
-                )
-                future_covariates = torch.cat(
-                    [future_covariates, torch.zeros(padding_shape).to(future_covariates)], dim=-1
-                )
-                future_covariates_mask = torch.cat(
-                    [future_covariates_mask, torch.zeros(padding_shape).to(future_covariates_mask)], dim=-1
-                )
+            # if num_output_patches * output_patch_size > future_covariates.shape[-1]:
+            #     padding_shape = (
+            #         *future_covariates.shape[:-1],
+            #         num_output_patches * output_patch_size - future_covariates.shape[-1],
+            #     )
+            #     future_covariates = torch.cat(
+            #         [future_covariates, torch.zeros(padding_shape).to(future_covariates)], dim=-1
+            #     )
+            #     future_covariates_mask = torch.cat(
+            #         [future_covariates_mask, torch.zeros(padding_shape).to(future_covariates_mask)], dim=-1
+            #     )
 
             patched_future_covariates = rearrange(
                 future_covariates, "b (n p) -> b n p", n=num_output_patches, p=output_patch_size
@@ -558,16 +567,16 @@ class Chronos2Model(PreTrainedModel):
         future_target_mask: torch.Tensor | None = None,
         output_attentions: bool = False,
     ):
-        self._validate_input(
-            context=context,
-            context_mask=context_mask,
-            future_covariates=future_covariates,
-            future_covariates_mask=future_covariates_mask,
-            group_ids=group_ids,
-            num_output_patches=num_output_patches,
-            future_target=future_target,
-            future_target_mask=future_target_mask,
-        )
+        # self._validate_input(
+        #     context=context,
+        #     context_mask=context_mask,
+        #     future_covariates=future_covariates,
+        #     future_covariates_mask=future_covariates_mask,
+        #     group_ids=group_ids,
+        #     num_output_patches=num_output_patches,
+        #     future_target=future_target,
+        #     future_target_mask=future_target_mask,
+        # )
 
         batch_size = context.shape[0]
         patched_context, attention_mask, loc_scale = self._prepare_patched_context(
@@ -753,3 +762,17 @@ class Chronos2Model(PreTrainedModel):
             enc_time_self_attn_weights=encoder_outputs.all_time_self_attn_weights,
             enc_group_self_attn_weights=encoder_outputs.all_group_self_attn_weights,
         )
+    
+def _get_chronos2_model(pretrained: bool = False, **kwargs) -> Chronos2Model:
+    config = Chronos2CoreConfig.from_pretrained("amazon/chronos-2")
+    model = Chronos2Model(config)
+    if pretrained:
+        pipeline = Chronos2Pipeline.from_pretrained("amazon/chronos-2")
+        model.load_state_dict(pipeline.model.state_dict(), strict=False)
+        
+    return model
+
+    
+@register_mase_checkpoint("chronos-2")
+def get_chronos2(pretrained: bool = False, **kwargs) -> Chronos2Model:
+    return _get_chronos2_model(pretrained=pretrained, **kwargs)

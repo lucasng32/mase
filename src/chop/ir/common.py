@@ -138,6 +138,7 @@ MASE_BUILTIN_FUNCS = [
     "zeros",  # Added for Wave2Vec
     "setitem",  # Added for Wave2Vec
     "invert",  # Added for Wave2Vec
+    "triu", # Added for chronos2
 ]
 
 
