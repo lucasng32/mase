@@ -56,6 +56,16 @@ MASE_IMPLICIT_FUNCS = [
     "cumsum",  # Added for Wave2Vec
     "flip",  # Added for Wave2Vec
     "repeat",  # Added for Wave2Vec
+    "pow", # Added for chronos2
+    "mean", # Added for chronos2
+    "float", # Added for chronos2
+    "square", # Added for chronos2
+    "sqrt", # Added for chronos2
+    "unfold", # Added for chronos2
+    "sum", # Added for chronos2
+    "div", # Added for chronos2
+    "cos", # Added for chronos2
+    "sin", # Added for chronos2
 ]
 
 MASE_MODULE_RELATED_FUNCS = [
@@ -135,6 +145,7 @@ MASE_BUILTIN_FUNCS = [
     "zeros",  # Added for Wave2Vec
     "setitem",  # Added for Wave2Vec
     "invert",  # Added for Wave2Vec
+    "triu", # Added for chronos2
 ]
 
 

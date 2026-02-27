@@ -155,6 +155,7 @@ def trace_torch_module(
             model,
             tracer_cls=tracer_cls,
             input_names=hf_input_names,
+            disable_check=True,
         )
         graph_module.custom_ops = custom_ops
 
