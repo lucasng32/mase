@@ -464,7 +464,7 @@ class Chronos2Model(PreTrainedModel):
 
             future_covariates = torch.where(future_covariates_mask > 0.0, future_covariates, 0.0)
 
-            if torch.isnan(future_covariates).any():
+            if not isinstance(future_covariates, torch.fx.Proxy) and torch.isnan(future_covariates).any():
                 raise ValueError(
                     "future_covariates contains NaN values at indices not masked by future_covariates_mask. "
                     "Input the correct future_covariates_mask or omit it to automatically infer the mask based on NaN values."

@@ -66,6 +66,7 @@ MASE_IMPLICIT_FUNCS = [
     "div", # Added for chronos2
     "cos", # Added for chronos2
     "sin", # Added for chronos2
+    "logical_not", # Added for chronos2
 ]
 
 MASE_MODULE_RELATED_FUNCS = [
@@ -146,6 +147,7 @@ MASE_BUILTIN_FUNCS = [
     "setitem",  # Added for Wave2Vec
     "invert",  # Added for Wave2Vec
     "triu", # Added for chronos2
+    "isnan", # Added for chronos2
 ]
 
 
