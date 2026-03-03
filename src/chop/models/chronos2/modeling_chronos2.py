@@ -5,7 +5,7 @@
 
 import copy
 from dataclasses import dataclass
-from typing import cast
+from typing import Any, cast
 
 import torch
 import torch.nn as nn
@@ -825,17 +825,40 @@ class Chronos2Model(PreTrainedModel):
             enc_time_self_attn_weights=encoder_outputs.all_time_self_attn_weights,
             enc_group_self_attn_weights=encoder_outputs.all_group_self_attn_weights,
         )
-    
+
+
+DEFAULT_CHRONOS2_MODEL_ID = "amazon/chronos-2"
+
+
+def _resolve_chronos2_model_id(load_kwargs: dict[str, Any]) -> str:
+    """Resolve user specified Chronos model path/ID or fall back to default."""
+    for key in ("model_id", "pretrained_model_name_or_path", "hf_checkpoint", "checkpoint"):
+        value = load_kwargs.pop(key, None)
+        if value:
+            return str(value)
+    return DEFAULT_CHRONOS2_MODEL_ID
+
+
+def _drop_mase_only_kwargs(load_kwargs: dict[str, Any]) -> None:
+    """Remove kwargs that are intended for MASE plumbing, not HF loaders."""
+    for key in ("dataset_info", "task", "quant_config", "name"):
+        load_kwargs.pop(key, None)
+
+
 def _get_chronos2_model(pretrained: bool = False, **kwargs) -> Chronos2Model:
-    config = Chronos2CoreConfig.from_pretrained("amazon/chronos-2")
+    load_kwargs = dict(kwargs)
+    model_id = _resolve_chronos2_model_id(load_kwargs)
+    _drop_mase_only_kwargs(load_kwargs)
+
+    config = Chronos2CoreConfig.from_pretrained(model_id, **load_kwargs)
     model = Chronos2Model(config)
     if pretrained:
-        pipeline = Chronos2Pipeline.from_pretrained("amazon/chronos-2")
+        pipeline = Chronos2Pipeline.from_pretrained(model_id, **load_kwargs)
         model.load_state_dict(pipeline.model.state_dict(), strict=False)
-        
+
     return model
 
-    
+
 @register_mase_checkpoint("chronos-2")
 def get_chronos2(pretrained: bool = False, **kwargs) -> Chronos2Model:
     return _get_chronos2_model(pretrained=pretrained, **kwargs)

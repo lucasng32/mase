@@ -71,6 +71,8 @@ dependencies = [
     "psutil",
     "Pillow==10.4.0",
     "mpmath==1.3.0",
+    "chronos-forecasting",
+    "hf_xet",
     "myst-nb",
     "sphinx-book-theme",
     "pydot",
