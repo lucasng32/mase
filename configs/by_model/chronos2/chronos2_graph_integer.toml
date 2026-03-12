@@ -1,0 +1,30 @@
+model = "chronos-2"
+dataset = "chronos_m4_daily"
+task = "timeseries"
+batch_size = 4
+num_workers = 0
+accelerator = "cpu"
+project_dir = "../mase_output"
+project = "chronos2_graph_integer"
+
+[passes.quantize]
+by = "type"
+
+[passes.quantize.default.config]
+name = "NA"
+
+[passes.quantize.linear.config]
+name = "integer"
+data_in_width = 8
+data_in_frac_width = 4
+weight_width = 8
+weight_frac_width = 4
+bias_width = 8
+bias_frac_width = 4
+
+[passes.quantize.matmul.config]
+name = "integer"
+data_in_width = 8
+data_in_frac_width = 4
+weight_width = 8
+weight_frac_width = 4

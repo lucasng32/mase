@@ -135,6 +135,10 @@ class MaseModelInfo:
     def is_nerf_model(self):
         return self.task_type == ModelTaskType.NERF
 
+    @property
+    def is_timeseries_model(self):
+        return self.task_type == ModelTaskType.TIMESERIES
+
 
 class ModelFactory:
     _model_info_dict: dict = {}
