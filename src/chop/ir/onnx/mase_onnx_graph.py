@@ -1,9 +1,10 @@
+import os
+from pathlib import Path
+
 import onnx
 from optimum.exporters.onnx import main_export
 
-import os
-
-HOME = os.environ["HOME"]
+HOME = os.environ.get("HOME", os.environ.get("USERPROFILE", str(Path.home())))
 
 from .utils import ONNX_OP_MAPPING
 

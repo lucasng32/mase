@@ -96,7 +96,7 @@ LOGO = f"""
             please refer to the wiki:
         https://github.com/DeepWok/mase/wiki
 """
-TASKS = ["classification", "cls", "translation", "tran", "language_modeling", "lm"]
+TASKS = ["classification", "cls", "translation", "tran", "language_modeling", "lm", "forecasting"]
 ACTIONS = ["train", "test", "transform", "search"]
 INFO_TYPE = ["all", "model", "dataset"]
 LOAD_TYPE = [

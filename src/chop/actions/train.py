@@ -5,7 +5,7 @@ from pathlib import Path
 import pytorch_lightning as pl
 from chop.tools.plt_wrapper import get_model_wrapper
 from chop.tools.checkpoint_load import load_model
-from chop.tools.get_input import get_dummy_input
+from chop.tools.get_input import get_dummy_input, get_hf_input_names
 from chop.passes.graph import (
     add_common_metadata_analysis_pass,
     init_metadata_analysis_pass,
@@ -119,8 +119,9 @@ def train(
     if save_path is not None and load_name is not None and load_type == "mz":
         accelerator = plt_trainer_args["accelerator"]
         accelerator = parse_accelerator(accelerator)
-        graph = MaseGraph(model)
-        dummy_input = get_dummy_input(model_info, data_module, task, device=accelerator)
+        hf_input_names = get_hf_input_names(model_info=model_info, task=task)
+        graph = MaseGraph(model, hf_input_names=hf_input_names)
+        dummy_input = get_dummy_input(model_info, data_module, task, device=accelerator, model=model)
         graph, _ = init_metadata_analysis_pass(graph, None)
         graph, _ = add_common_metadata_analysis_pass(graph, {"dummy_in": dummy_input})
         graph, _ = add_software_metadata_analysis_pass(graph, None)

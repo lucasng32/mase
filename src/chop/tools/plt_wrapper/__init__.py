@@ -6,6 +6,7 @@ from .nlp import (
     NLPLanguageModelingModelWrapper,
     NLPTranslationModelWrapper,
 )
+from .timeseries import TimeSeriesForecastingModelWrapper
 
 
 def get_model_wrapper(model_info, task: str):
@@ -23,5 +24,11 @@ def get_model_wrapper(model_info, task: str):
                 return NLPLanguageModelingModelWrapper
             case "translation" | "tran":
                 return NLPTranslationModelWrapper
+            case _:
+                raise ValueError(f"Task {task} is not supported for {model_info.name}")
+    elif model_info.is_timeseries_model:
+        match task:
+            case "forecasting":
+                return TimeSeriesForecastingModelWrapper
             case _:
                 raise ValueError(f"Task {task} is not supported for {model_info.name}")

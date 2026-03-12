@@ -1,4 +1,17 @@
+import os
+import sys
+from pathlib import Path
+
 import pytest
+
+
+REPO_ROOT = Path(__file__).resolve().parent
+SRC_ROOT = REPO_ROOT / "src"
+
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
+os.environ.setdefault("HOME", os.environ.get("USERPROFILE", str(Path.home())))
 
 
 def pytest_addoption(parser):

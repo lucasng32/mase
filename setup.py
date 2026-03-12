@@ -34,6 +34,7 @@ requirements = [
     "timm",
     "pytorch-nlp",
     "datasets==3.3.2",
+    "dill",
     "evaluate==0.4.3",
     "ipython",
     "ipdb",

@@ -20,6 +20,7 @@ from .verify import (
     verify_software_metadata_analysis_pass,
 )
 from .quantization import calculate_avg_bits_mg_analysis_pass
+from .quantization import profile_spectral_statistics_analysis_pass
 
 from .pruning import (
     add_pruning_metadata_analysis_pass,
