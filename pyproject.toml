@@ -83,6 +83,7 @@ dependencies = [
     "mase-triton>=0.0.6.post4; platform_machine == 'x86_64' and sys_platform == 'linux'",
     "torchaudio>=2.6.0",
     "fev>=0.7.0",
+    "chronos-forecasting>=2.2.2",
 ]
 
 [build-system]

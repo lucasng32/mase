@@ -348,6 +348,9 @@ func_data = {
         "dim": "config", 
         "keepdim": "config"
     }, 
+    #"https://docs.pytorch.org/docs/stable/generated/torch.isnan.html#torch.isnan"
+    "isnan": {"input": "data_in"}, # Added for chronos2
+    
 }
 
 module_data = {
@@ -545,6 +548,7 @@ method_data = {
     "float": {"memory_format": "config"}, # Added for chronos2
     "cos": {}, # Added for chronos2
     "sin": {}, # Added for chronos2
+    "logical_not": {}, # Added for chronos2
 }
 
 # ----------------------------------------------------------
