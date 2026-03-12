@@ -247,7 +247,7 @@ SOFTWARE_PARAM_ANALYSIS_LAYERS = {
         "placeholder": analyze_software_meta_param_placeholder,
     },
     "get_attr": {
-        "get_attr": analyze_software_meta_param_get_attr,
+        "constant": analyze_software_meta_param_get_attr,
     },
     "output": {
         "output": analyze_software_meta_param_output,
