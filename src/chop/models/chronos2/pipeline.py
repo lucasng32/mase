@@ -624,8 +624,9 @@ class Chronos2Pipeline(BaseChronosPipeline):
             output_patch_size=self.model_output_patch_size,
             mode=DatasetMode.TEST,
         )
+        device = next(self.model.parameters()).device
         test_loader = DataLoader(
-            test_dataset, batch_size=None, pin_memory=self.model.device.type == "cuda", shuffle=False, drop_last=False
+            test_dataset, batch_size=None, pin_memory=device.type == "cuda", shuffle=False, drop_last=False
         )
 
         all_predictions: list[torch.Tensor] = []
@@ -663,9 +664,11 @@ class Chronos2Pipeline(BaseChronosPipeline):
         max_output_patches: int,
         target_idx_ranges: list[tuple[int, int]],
     ) -> list[torch.Tensor]:
-        context = context.to(device=self.model.device, dtype=torch.float32)
-        group_ids = group_ids.to(device=self.model.device)
-        future_covariates = future_covariates.to(device=self.model.device, dtype=torch.float32)
+        # Safely grab the device from the model's parameters
+        device = next(self.model.parameters()).device
+        context = context.to(device=device, dtype=torch.float32)
+        group_ids = group_ids.to(device=device)
+        future_covariates = future_covariates.to(device=device, dtype=torch.float32)
 
         def get_num_output_patches(remaining_horizon: int):
             num_output_patches = math.ceil(remaining_horizon / self.model_output_patch_size)

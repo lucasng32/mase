@@ -29,6 +29,7 @@ from .transforms import (
     onnx_annotate_transform_pass,
     raise_granularity_transform_pass,
     ann2snn_transform_pass,
+    fused_time_group_attention_pass,
 )
 
 from .interface import (
@@ -77,6 +78,7 @@ TRANSFORM_PASSES = [
     "prune",
     "prune_detach_hook" "conv_bn_fusion",
     "logicnets_fusion",
+    "fused_time_group_attention",
 ]
 
 INTERFACE_PASSES = [
@@ -120,6 +122,7 @@ PASSES = {
     "conv_bn_fusion": conv_bn_fusion_transform_pass,
     "logicnets_fusion": logicnets_fusion_transform_pass,
     "onnx_annotate": onnx_annotate_transform_pass,
+    "fused_time_group_attention": fused_time_group_attention_pass,
 }
 
 if check_dependencies("runtime_analysis_pass"):

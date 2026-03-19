@@ -299,6 +299,97 @@ class MHA(nn.Module):
 
         return AttentionOutput(hidden_states=attn_output, attn_weights=attn_weights if output_attentions else None)
 
+import torch
+from torch import nn
+
+class FusedQKV_MHA(nn.Module):
+    """A drop-in replacement that steals weights from an old MHA module and fuses them."""
+    def __init__(self, old_mha):
+        super().__init__()
+        self.config = old_mha.config
+        self.n_heads = old_mha.n_heads
+        self.kv_proj_dim = old_mha.kv_proj_dim
+        self.inner_dim = old_mha.inner_dim
+        self.use_rope = old_mha.use_rope
+        self.dropout = old_mha.dropout
+        
+        # 1. Steal the Rope and Output projections
+        if self.use_rope:
+            self.rope_embed = old_mha.rope_embed
+        self.o = old_mha.o
+        
+        # 2. Create the massive Fused QKV layer
+        self.qkv = nn.Linear(self.config.d_model, 3 * self.inner_dim, bias=False)
+        
+        # 3. Copy and concatenate the weights from the old module natively in VRAM
+        with torch.no_grad():
+            self.qkv.weight.data = torch.cat([
+                old_mha.q.weight.data, 
+                old_mha.k.weight.data, 
+                old_mha.v.weight.data
+            ], dim=0)
+
+        # 4. Steal the attention routing methods from the old module
+        self._sdpa_attention = old_mha._sdpa_attention
+        self._eager_attention = old_mha._eager_attention
+
+    def forward(
+        self, hidden_states, mask, encoder_states=None, position_ids=None, output_attentions=False
+    ):
+        if self.use_rope:
+            assert position_ids is not None
+            
+        is_cross_attention = encoder_states is not None
+        
+        def shape(states: torch.Tensor) -> torch.Tensor:
+            B, S = states.shape[0], states.shape[1]
+            return states.view(B, S, self.n_heads, self.kv_proj_dim).transpose(1, 2)
+
+        def unshape(states: torch.Tensor) -> torch.Tensor:
+            B, S = states.shape[0], states.shape[2] 
+            return states.transpose(1, 2).reshape(B, S, -1)
+
+        # ==========================================
+        # THE FUSED QKV LOGIC
+        # ==========================================
+        if not is_cross_attention:
+            # ONE read from HBM!
+            qkv_states = self.qkv(hidden_states)
+            q_out, k_out, v_out = qkv_states.chunk(3, dim=-1)
+            
+            query_states = shape(q_out)
+            key_states = shape(k_out)
+            value_states = shape(v_out)
+        else:
+            # If it's cross attention, we'd need a separate fusion strategy for encoder_states. 
+            # For this test, we just let it fail gracefully or you can pass through the old logic.
+            raise NotImplementedError("This hack is only for Self-Attention layers.")
+
+        if self.use_rope:
+            # RoPE expects the class from layers.py, ensure it's imported
+            from chop.models.chronos2.layers import RoPE 
+            cos, sin = self.rope_embed(value_states, position_ids)
+            query_states, key_states = RoPE.apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        attn_implementation = self.config._attn_implementation if not output_attentions else "eager"
+        
+        if attn_implementation == "sdpa":
+            attn_output, attn_weights = self._sdpa_attention(query_states, key_states, value_states, mask)
+        else:
+            attn_output, attn_weights = self._eager_attention(query_states, key_states, value_states, mask)
+
+        from transformers.utils import ModelOutput
+        from dataclasses import dataclass
+        @dataclass
+        class AttentionOutput(ModelOutput):
+            hidden_states: torch.Tensor | None = None
+            attn_weights: torch.Tensor | None = None
+
+        return AttentionOutput(
+            hidden_states=self.o(unshape(attn_output)), 
+            attn_weights=attn_weights if output_attentions else None
+        )
+
 
 class TimeSelfAttention(nn.Module):
     def __init__(self, config: Chronos2CoreConfig):
@@ -317,32 +408,6 @@ class TimeSelfAttention(nn.Module):
         normed_hidden_states = self.layer_norm(hidden_states)
         attention_output: AttentionOutput = self.self_attention(
             normed_hidden_states, position_ids=position_ids, mask=attention_mask, output_attentions=output_attentions
-        )
-        hidden_states = hidden_states + self.dropout(attention_output[0])
-
-        return AttentionOutput(hidden_states=hidden_states, attn_weights=attention_output.attn_weights)
-
-
-class TimeCrossAttention(nn.Module):
-    def __init__(self, config: Chronos2CoreConfig):
-        super().__init__()
-        self.cross_attention = MHA(config, use_rope=False)
-        self.layer_norm = Chronos2LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
-        self.dropout = nn.Dropout(config.dropout_rate)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor,
-        encoder_states: torch.Tensor,
-        output_attentions: bool = False,
-    ) -> AttentionOutput:
-        normed_hidden_states = self.layer_norm(hidden_states)
-        attention_output: AttentionOutput = self.cross_attention(
-            normed_hidden_states,
-            mask=attention_mask,
-            encoder_states=encoder_states,
-            output_attentions=output_attentions,
         )
         hidden_states = hidden_states + self.dropout(attention_output[0])
 
@@ -411,3 +476,38 @@ class ResidualBlock(nn.Module):
         if self.use_layer_norm:
             return self.layer_norm(out)
         return out
+
+class FusedTimeGroupAttention(nn.Module):
+    def __init__(self, config: Chronos2CoreConfig):
+        super().__init__()
+        self.time_attention = MHA(config, use_rope=True)
+        self.time_layer_norm = Chronos2LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
+        self.time_dropout = nn.Dropout(config.dropout_rate)
+
+        self.group_attention = MHA(config, use_rope=False)
+        self.group_layer_norm = Chronos2LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
+        self.group_dropout = nn.Dropout(config.dropout_rate)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        group_time_mask: torch.Tensor,
+        output_attentions: bool = False,
+    ):
+        normed_hidden_states = self.time_layer_norm(hidden_states)
+        attention_output_t = self.time_attention(
+            normed_hidden_states, position_ids=position_ids, mask=attention_mask, output_attentions=output_attentions
+        )
+        hidden_states = hidden_states + self.time_dropout(attention_output_t[0])
+
+        hidden_states = hidden_states.transpose(0, 1)
+        normed_hidden_states = self.group_layer_norm(hidden_states)
+        attention_output_g = self.group_attention(
+            normed_hidden_states, mask=group_time_mask, output_attentions=output_attentions
+        )
+        hidden_states = hidden_states + self.group_dropout(attention_output_g[0])
+        hidden_states = hidden_states.transpose(0, 1)
+        
+        return AttentionOutput(hidden_states=hidden_states, attn_weights=None)

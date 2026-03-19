@@ -13,3 +13,5 @@ from .granularity import raise_granularity_transform_pass
 from .patching import patch_metadata_transform_pass
 
 from .lora import insert_lora_adapter_transform_pass, fuse_lora_weights_transform_pass
+
+from .fused_time_group_attention import fused_time_group_attention_pass
