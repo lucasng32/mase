@@ -94,13 +94,36 @@ def attach_chronos2_graph_module_metadata(graph_module, reference_model, wrap_fo
         if hasattr(reference_model, attr):
             setattr(graph_module, attr, getattr(reference_model, attr))
 
+    device = None
     if hasattr(reference_model, "device"):
-        graph_module.device = reference_model.device
+        device = reference_model.device
+    elif hasattr(reference_model, "parameters"):
+        try:
+            device = next(reference_model.parameters()).device
+        except StopIteration:
+            device = None
+
+    if device is not None:
+        graph_module.to(device)
+        graph_module.device = device
 
     if wrap_forward:
         original_forward = graph_module.forward
 
         def _wrapped_forward(*args, **kwargs):
+            context = kwargs.get("context")
+            input_patch_size = getattr(getattr(graph_module, "chronos_config", None), "input_patch_size", None)
+            if isinstance(context, torch.Tensor) and isinstance(input_patch_size, int):
+                context_length = context.shape[-1]
+                padding = (-context_length) % input_patch_size
+                if padding:
+                    left_padding = torch.full(
+                        (*context.shape[:-1], padding),
+                        fill_value=torch.nan,
+                        dtype=context.dtype,
+                        device=context.device,
+                    )
+                    kwargs["context"] = torch.cat((left_padding, context), dim=-1)
             output = original_forward(*args, **kwargs)
             if isinstance(output, dict) and not isinstance(output, Chronos2Output):
                 return Chronos2Output(**output)
