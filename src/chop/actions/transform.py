@@ -18,7 +18,7 @@ from chop.passes.graph.interface import (
 from chop.passes.graph.utils import deepcopy_mase_graph
 from chop.tools.checkpoint_load import load_model
 from chop.tools.config_load import load_config
-from chop.tools.get_input import InputGenerator, get_cf_args, get_dummy_input
+from chop.tools.get_input import InputGenerator, get_cf_args, get_dummy_input, get_hf_input_names
 from chop.tools.utils import parse_accelerator, to_numpy_if_tensor
 
 from chop.passes.graph.transforms import metadata_value_type_cast_transform_pass
@@ -217,7 +217,8 @@ def transform_graph(
         cf_args = config["cf_args"]
 
     # graph generation
-    graph = MaseGraph(model=model, cf_args=cf_args)
+    hf_input_names = get_hf_input_names(model_info=model_info, task=task)
+    graph = MaseGraph(model=model, cf_args=cf_args, hf_input_names=hf_input_names)
     # graph_metadata = Mase
     graph, _ = init_metadata_analysis_pass(graph, pass_args=None)
 
@@ -232,6 +233,7 @@ def transform_graph(
             data_module=data_module,
             task=task,
             device=accelerator,
+            model=model,
         )
         if len(graph.model.additional_inputs) > 0:
             dummy_in = dummy_in | graph.model.additional_inputs
@@ -390,6 +392,7 @@ def transform_graph(
                     data_module=data_module,
                     task=task,
                     which_dataloader="train",
+                    model=model,
                 )
                 pass_config["train_data_loader"] = input_generator
                 graph, _ = PASSES[pass_name](graph, pass_args=pass_config)
@@ -399,6 +402,7 @@ def transform_graph(
                     data_module=data_module,
                     task=task,
                     which_dataloader="train",
+                    model=model,
                 )
                 pass_config["input_generator"] = input_generator
                 graph, _ = PASSES[pass_name](graph, pass_args=pass_config)
@@ -461,6 +465,7 @@ def transform_graph(
                     data_module=data_module,
                     task=task,
                     which_dataloader="val",
+                    model=model,
                 )
                 pass_config["model_name"] = model_name
                 pass_config["input_generator"] = input_generator

@@ -87,7 +87,7 @@ def search(
         model=model,
         model_info=model_info,
         config=search_space_config,
-        dummy_input=get_dummy_input(model_info, data_module, task, device=accelerator),
+        dummy_input=get_dummy_input(model_info, data_module, task, device=accelerator, model=model),
         accelerator=accelerator,
         data_module=data_module,
     )
