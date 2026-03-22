@@ -1,12 +1,14 @@
 """
-Optimized drop-in replacements for Chronos-2 attention layers.
+Optimized drop-in replacement for the MHA module inside GroupSelfAttention.
 
-``FastGroupSelfAttention`` replaces ``GroupSelfAttention`` with a computation
-that exploits the block-diagonal sparsity of the group attention mask.
+``GroupAwareMHA`` replaces ``GroupSelfAttention.self_attention`` (an ``MHA``
+instance) with a group-aware attention module that exploits the block-diagonal
+sparsity of the group attention mask.  The outer ``GroupSelfAttention`` shell
+(layer norm, residual, dropout) is left completely untouched.
 
-Three dispatch paths, all chosen at construction time from the precomputed
-group partition — the forward pass contains no Python control flow that
-depends on runtime tensor values:
+Three dispatch paths, chosen at construction time from the precomputed group
+partition — the forward pass contains no Python control flow that depends on
+runtime tensor values:
 
   1. **Univariate** (all groups size 1):
        Skip Q, K and the attention matmul entirely.
@@ -18,10 +20,13 @@ depends on runtime tensor values:
 
   3. **Packed sparse** (CPU or Triton unavailable):
        Pad each group to max_group_size, stack into one tensor, run a
-       single batched MHA call, scatter real slots back.
+       single batched attention call, scatter real slots back.
 
 All indexing structures are precomputed once at MASE pass application time
 and stored as registered buffers.
+
+Weight keys (q/k/v/o) match ``MHA`` exactly, so
+``load_state_dict(mha.state_dict())`` works with ``strict=True``.
 """
 
 from __future__ import annotations
@@ -31,10 +36,11 @@ from dataclasses import dataclass
 from enum import Enum, auto
 
 import torch
-from torch import nn
+import torch.nn as nn
+import torch.nn.functional as F
 
 from .configuration_chronos2 import Chronos2CoreConfig
-from .layers import AttentionOutput, Chronos2LayerNorm, MHA
+from .layers import AttentionOutput
 from .triton_grouped_attn import is_triton_available, triton_grouped_attention
 
 logger = logging.getLogger(__name__)
@@ -58,7 +64,7 @@ class GroupPartition:
 
     @classmethod
     def from_group_ids(cls, group_ids: torch.Tensor) -> GroupPartition:
-        ids = group_ids.cpu()
+        ids = group_ids
         groups = [(ids == g).nonzero(as_tuple=True)[0] for g in ids.unique()]
         return cls(
             groups=groups,
@@ -120,13 +126,17 @@ class KernelDispatcher:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# FastGroupSelfAttention
+# GroupAwareMHA
 # ═══════════════════════════════════════════════════════════════════════════════
-class FastGroupSelfAttention(nn.Module):
-    """Drop-in replacement for ``GroupSelfAttention``.
+class GroupAwareMHA(nn.Module):
+    """Drop-in replacement for ``MHA`` inside ``GroupSelfAttention``.
 
-    State-dict keys match ``GroupSelfAttention`` so weights load with
-    ``load_state_dict(..., strict=False)``.
+    Weight keys (q/k/v/o) are identical to ``MHA`` so weights transfer with
+    ``load_state_dict(mha.state_dict(), strict=True)``.
+
+    The MASE pass sets ``group_self_attn.self_attention = GroupAwareMHA(...)``
+    leaving the outer ``GroupSelfAttention`` (layer norm, residual, dropout)
+    completely untouched.
     """
 
     def __init__(
@@ -136,12 +146,21 @@ class FastGroupSelfAttention(nn.Module):
         variant: KernelVariant | None = None,
     ):
         super().__init__()
-        self.self_attention = MHA(config, use_rope=False)
-        self.layer_norm = Chronos2LayerNorm(
-            config.d_model, eps=config.layer_norm_epsilon
-        )
-        self.dropout = nn.Dropout(config.dropout_rate)
 
+        # ── weights matching MHA exactly ──────────────────────────────
+        self.d_model: int = config.d_model
+        self.kv_proj_dim: int = config.d_kv
+        self.n_heads: int = config.num_heads
+        self.dropout: float = config.dropout_rate
+        self.inner_dim: int = self.n_heads * self.kv_proj_dim
+        self.config = config
+
+        self.q = nn.Linear(self.d_model, self.inner_dim, bias=False)
+        self.k = nn.Linear(self.d_model, self.inner_dim, bias=False)
+        self.v = nn.Linear(self.d_model, self.inner_dim, bias=False)
+        self.o = nn.Linear(self.inner_dim, self.d_model, bias=False)
+
+        # ── dispatch ──────────────────────────────────────────────────
         self._partition = partition
         self._variant = variant or KernelVariant.PACKED_SPARSE
 
@@ -156,25 +175,34 @@ class FastGroupSelfAttention(nn.Module):
     # Buffer pre-computation
     # ------------------------------------------------------------------
     def _precompute_triton_buffers(self, partition: GroupPartition) -> None:
-        """Build sort permutation and cumulative-seqlens for the Triton path."""
+        """Build sort permutation and cumulative-seqlens for the Triton path.
+
+        Registered as non-persistent so they don't appear in state_dict() —
+        they are always recomputed from the group partition.
+        """
         perm_parts: list[torch.Tensor] = []
         cu: list[int] = [0]
         for g in partition.groups:
             perm_parts.append(g)
             cu.append(cu[-1] + g.numel())
 
-        self.register_buffer("_sort_perm", torch.cat(perm_parts))
+        self.register_buffer("_sort_perm", torch.cat(perm_parts), persistent=False)
         self.register_buffer(
-            "_cu_seqlens", torch.tensor(cu, dtype=torch.int32)
+            "_cu_seqlens", torch.tensor(cu, dtype=torch.int32), persistent=False
         )
 
-        # Inverse permutation for unsorting the output.
         inv = torch.empty_like(self._sort_perm)
-        inv[self._sort_perm] = torch.arange(len(self._sort_perm))
-        self.register_buffer("_unsort_perm", inv)
+        inv[self._sort_perm] = torch.arange(
+            len(self._sort_perm), device=self._sort_perm.device
+        )
+        self.register_buffer("_unsort_perm", inv, persistent=False)
 
     def _precompute_packed_buffers(self, partition: GroupPartition) -> None:
-        """Build padded gather/scatter indices for the packed-sparse path."""
+        """Build padded gather/scatter indices for the packed-sparse path.
+
+        Registered as non-persistent so they don't appear in state_dict() —
+        they are always recomputed from the group partition.
+        """
         G = partition.num_groups
         M = partition.max_group_size
         fmin = torch.finfo(torch.float32).min
@@ -193,73 +221,65 @@ class FastGroupSelfAttention(nn.Module):
                 real_flat.append(i * M + j)
                 scatter_b.append(g[j].item())
 
-        self.register_buffer("_group_indices_padded", group_indices_padded)
-        self.register_buffer("_pad_mask", pad_mask)
+        self.register_buffer("_group_indices_padded", group_indices_padded, persistent=False)
+        self.register_buffer("_pad_mask", pad_mask, persistent=False)
         self.register_buffer(
-            "_real_flat_idx", torch.tensor(real_flat, dtype=torch.long)
+            "_real_flat_idx", torch.tensor(real_flat, dtype=torch.long), persistent=False
         )
         self.register_buffer(
-            "_scatter_b_idx", torch.tensor(scatter_b, dtype=torch.long)
+            "_scatter_b_idx", torch.tensor(scatter_b, dtype=torch.long), persistent=False
         )
         self._num_groups = G
         self._max_size = M
 
     # ------------------------------------------------------------------
-    # Forward
+    # Forward — identical signature to MHA.forward()
     # ------------------------------------------------------------------
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor,
+        mask: torch.Tensor,
+        encoder_states: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
         output_attentions: bool = False,
     ) -> AttentionOutput:
-        """
+        """Group-aware forward pass.
+
         Args:
-            hidden_states:  ``(B, T, d_model)``
-            attention_mask: ``(T, 1, B, B)`` additive group-time mask (used
-                only as a dtype/device reference in optimised paths).
+            hidden_states: ``(T, B, d_model)`` — already transposed by
+                ``GroupSelfAttention`` so the batch axis is the seq dim.
+            mask: group-time additive mask from the model; not used at runtime
+                by the optimised paths (group structure is baked into buffers).
         """
-        hidden_states = hidden_states.transpose(0, 1)  # (T, B, d)
-        T, B, d = hidden_states.shape
-        normed = self.layer_norm(hidden_states)
-
         if self._variant == KernelVariant.UNIVARIATE:
-            attn_out = self._forward_univariate(normed)
+            attn_out = self._forward_univariate(hidden_states)
         elif self._variant == KernelVariant.TRITON:
-            attn_out = self._forward_triton(normed)
+            attn_out = self._forward_triton(hidden_states)
         else:
-            attn_out = self._forward_packed_sparse(normed, hidden_states.dtype)
+            attn_out = self._forward_packed_sparse(hidden_states)
 
-        output = hidden_states + self.dropout(attn_out)
-        return AttentionOutput(
-            hidden_states=output.transpose(0, 1), attn_weights=None
-        )
+        return AttentionOutput(hidden_states=attn_out, attn_weights=None)
 
     # ------------------------------------------------------------------
     # Dispatch paths
     # ------------------------------------------------------------------
-    def _forward_univariate(self, normed: torch.Tensor) -> torch.Tensor:
-        """All groups have size 1 → softmax is trivially 1, skip Q and K."""
-        v_out = self.self_attention.v(normed)  # (T, B, inner_dim)
-        return self.self_attention.o(v_out)  # (T, B, d)
+    def _forward_univariate(self, x: torch.Tensor) -> torch.Tensor:
+        """All groups size 1 → softmax([single logit]) = 1, so out = V."""
+        return self.o(self.v(x))
 
-    def _forward_triton(self, normed: torch.Tensor) -> torch.Tensor:
+    def _forward_triton(self, x: torch.Tensor) -> torch.Tensor:
         """Fused Triton kernel — no padding, no Python loops."""
-        T, B, d = normed.shape
-        mha = self.self_attention
-        H, D = mha.n_heads, mha.kv_proj_dim
+        T, B, d = x.shape
+        H, D = self.n_heads, self.kv_proj_dim
 
-        # Project Q, K, V: (T, B, d) → (T, B, inner) → (T, B, H, D)
-        q = mha.q(normed).view(T, B, H, D)
-        k = mha.k(normed).view(T, B, H, D)
-        v = mha.v(normed).view(T, B, H, D)
+        q = self.q(x).view(T, B, H, D)
+        k = self.k(x).view(T, B, H, D)
+        v = self.v(x).view(T, B, H, D)
 
-        # Sort batch by group: (T, B, H, D) → (T, B_sorted, H, D)
         q = q[:, self._sort_perm, :, :]
         k = k[:, self._sort_perm, :, :]
         v = v[:, self._sort_perm, :, :]
 
-        # Reshape to (T, H, B_sorted, D) for the kernel
         q = q.permute(0, 2, 1, 3).contiguous()
         k = k.permute(0, 2, 1, 3).contiguous()
         v = v.permute(0, 2, 1, 3).contiguous()
@@ -273,33 +293,46 @@ class FastGroupSelfAttention(nn.Module):
             scale=1.0,  # Chronos2 uses no sqrt scaling
         )
 
-        # (T, H, B_sorted, D) → (T, B_sorted, H, D) → (T, B_sorted, inner)
         out = out.permute(0, 2, 1, 3).reshape(T, B, -1)
-
-        # Unsort back to original batch order
         out = out[:, self._unsort_perm, :]
 
-        return mha.o(out)  # (T, B, d)
+        return self.o(out)
 
-    def _forward_packed_sparse(
-        self, normed: torch.Tensor, dtype: torch.dtype
-    ) -> torch.Tensor:
-        """Gather → pad → batched MHA → scatter. Works on any device."""
-        T, B, d = normed.shape
+    def _forward_packed_sparse(self, x: torch.Tensor) -> torch.Tensor:
+        """Gather → pad → group attention → scatter. Works on any device."""
+        T, B, d = x.shape
         G, M = self._num_groups, self._max_size
+        H, D = self.n_heads, self.kv_proj_dim
 
-        packed = normed[:, self._group_indices_padded, :].reshape(T * G, M, d)
+        # Gather and pad: (T, G, M, d) → (T*G, M, d)
+        packed = x[:, self._group_indices_padded, :].reshape(T * G, M, d)
 
+        # Project QKV and reshape to (T*G, H, M, D)
+        def _shape(proj: torch.Tensor) -> torch.Tensor:
+            return proj.view(T * G, M, H, D).transpose(1, 2)
+
+        q = _shape(self.q(packed))
+        k = _shape(self.k(packed))
+        v = _shape(self.v(packed))
+
+        # Padding mask: (G, 1, M, M) → broadcast over T and H
         batched_mask = (
-            self._pad_mask.to(dtype=dtype)
+            self._pad_mask.to(dtype=x.dtype)
             .unsqueeze(0)
             .expand(T, -1, -1, -1, -1)
             .reshape(T * G, 1, M, M)
         )
 
-        result = self.self_attention(
-            packed, mask=batched_mask, output_attentions=False
+        # Eager attention — matches original GroupSelfAttention exactly
+        scores = torch.matmul(q, k.transpose(-1, -2)) + batched_mask
+        attn_weights = F.softmax(scores.float(), dim=-1).type_as(scores)
+        attn_weights = F.dropout(
+            attn_weights, p=self.dropout, training=self.training
         )
+        attn_out = torch.matmul(attn_weights, v)  # (T*G, H, M, D)
 
-        flat = result.hidden_states.reshape(T, G * M, d)
-        return flat[:, self._real_flat_idx, :]  # (T, B, d)
+        # Unshape → project → scatter back
+        attn_out = attn_out.transpose(1, 2).reshape(T * G, M, self.inner_dim)
+        attn_out = self.o(attn_out).reshape(T, G * M, d)
+
+        return attn_out[:, self._real_flat_idx, :]
