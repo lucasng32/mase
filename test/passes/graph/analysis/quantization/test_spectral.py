@@ -46,18 +46,32 @@ def test_profile_spectral_statistics_collects_samples():
     )
     assert "linear_a" in result["spectral_stats"]
     assert result["spectral_stats"]["linear_a"]["num_observations"] > 0
+    assert result["spectral_stats"]["linear_a"]["input_samples"]
+    assert result["spectral_stats"]["linear_a"]["output_samples"]
 
 
 def test_spectral_calibrate_quantization_returns_frac_widths():
     graph = _fake_graph()
+    with torch.no_grad():
+        input_a = torch.randn(2, 8)
+        output_a = graph.modules["linear_a"](input_a)
+        input_b = output_a
+        output_b = graph.modules["linear_b"](input_b)
+
     spectral_stats = {
         "linear_a": {
-            "samples": [torch.randn(2, 8), torch.randn(2, 8)],
+            "samples": [output_a],
+            "input_samples": [input_a],
+            "output_samples": [output_a],
         },
         "linear_b": {
-            "samples": [torch.randn(2, 4)],
+            "samples": [output_b],
+            "input_samples": [input_b],
+            "output_samples": [output_b],
         },
     }
     config = spectral_calibrate_quantization(graph, spectral_stats, width=8)
     assert "linear_a" in config
     assert "data_in_frac_width" in config["linear_a"]
+    assert "weight_frac_width" in config["linear_a"]
+    assert "output_spectral_score" in config["linear_a"]

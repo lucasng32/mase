@@ -4,6 +4,7 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from chop.ir.graph import MaseGraph
 
@@ -51,6 +52,36 @@ def _spectral_distance(reference: torch.Tensor, quantized: torch.Tensor, num_ban
     return float(torch.abs(ref_bands - q_bands).sum().item() / denom)
 
 
+def _extract_tensor(maybe_tensor):
+    if isinstance(maybe_tensor, (tuple, list)):
+        return maybe_tensor[0]
+    return maybe_tensor
+
+
+def _fake_quantized_linear_output(
+    module: nn.Linear,
+    input_sample: torch.Tensor,
+    width: int,
+    data_frac_width: int,
+    weight_frac_width: int,
+    bias_width: int,
+    bias_frac_width: int,
+) -> torch.Tensor:
+    input_q = _fake_quantize_integer(input_sample.detach().cpu().to(torch.float32), width=width, frac_width=data_frac_width)
+    weight_q = _fake_quantize_integer(
+        module.weight.detach().cpu().to(torch.float32), width=width, frac_width=weight_frac_width
+    )
+
+    bias = module.bias
+    bias_q = None
+    if bias is not None:
+        bias_q = _fake_quantize_integer(
+            bias.detach().cpu().to(torch.float32), width=bias_width, frac_width=bias_frac_width
+        )
+
+    return F.linear(input_q, weight_q, bias_q)
+
+
 def profile_spectral_statistics_analysis_pass(graph: MaseGraph, pass_args: dict | None = None):
     pass_args = pass_args or {}
     calibration_batches = pass_args["calibration_batches"]
@@ -77,6 +108,8 @@ def profile_spectral_statistics_analysis_pass(graph: MaseGraph, pass_args: dict 
             "num_observations": 0,
             "max_abs": 0.0,
             "samples": [],
+            "input_samples": [],
+            "output_samples": [],
         }
         for module_name, _ in module_targets
     }
@@ -84,13 +117,22 @@ def profile_spectral_statistics_analysis_pass(graph: MaseGraph, pass_args: dict 
     hooks = []
     for module_name, module in module_targets:
         def _hook(_module, _inputs, output, module_name=module_name):
-            tensor = output[0] if isinstance(output, tuple) else output
-            tensor = tensor.detach().cpu().to(torch.float32)
-            stats[module_name]["band_energy_sum"] += _compute_band_energies(tensor, num_bands=num_bands)
+            input_tensor = _extract_tensor(_inputs)
+            output_tensor = _extract_tensor(output)
+
+            input_tensor = input_tensor.detach().cpu().to(torch.float32)
+            output_tensor = output_tensor.detach().cpu().to(torch.float32)
+
+            stats[module_name]["band_energy_sum"] += _compute_band_energies(output_tensor, num_bands=num_bands)
             stats[module_name]["num_observations"] += 1
-            stats[module_name]["max_abs"] = max(stats[module_name]["max_abs"], float(tensor.abs().max().item()))
+            stats[module_name]["max_abs"] = max(
+                stats[module_name]["max_abs"],
+                float(max(input_tensor.abs().max().item(), output_tensor.abs().max().item())),
+            )
             if len(stats[module_name]["samples"]) < max_samples_per_layer:
-                stats[module_name]["samples"].append(tensor)
+                stats[module_name]["samples"].append(output_tensor)
+                stats[module_name]["input_samples"].append(input_tensor)
+                stats[module_name]["output_samples"].append(output_tensor)
 
         hooks.append(module.register_forward_hook(_hook))
 
@@ -114,6 +156,8 @@ def profile_spectral_statistics_analysis_pass(graph: MaseGraph, pass_args: dict 
             "num_observations": values["num_observations"],
             "max_abs": values["max_abs"],
             "samples": values["samples"],
+            "input_samples": values["input_samples"],
+            "output_samples": values["output_samples"],
         }
 
     return graph, {"spectral_stats": spectral_stats}
@@ -140,39 +184,45 @@ def spectral_calibrate_quantization(
         if not isinstance(module, nn.Linear):
             continue
 
-        activation_samples = layer_stats.get("samples", [])
-        if not activation_samples:
+        input_samples = layer_stats.get("input_samples", [])
+        output_samples = layer_stats.get("output_samples", [])
+        if not input_samples or not output_samples:
             continue
 
         best_data_frac_width = default_frac_width
-        best_data_score = float("inf")
-        for frac_width in frac_width_candidates:
-            score = 0.0
-            for sample in activation_samples:
-                score += _spectral_distance(sample, _fake_quantize_integer(sample, width=width, frac_width=frac_width), num_bands=num_bands)
-            score /= len(activation_samples)
-            if score < best_data_score:
-                best_data_score = score
-                best_data_frac_width = frac_width
-
-        weight = module.weight.detach().cpu().to(torch.float32)
         best_weight_frac_width = default_frac_width
-        best_weight_score = float("inf")
-        for frac_width in frac_width_candidates:
-            score = _spectral_distance(weight, _fake_quantize_integer(weight, width=width, frac_width=frac_width), num_bands=num_bands)
-            if score < best_weight_score:
-                best_weight_score = score
-                best_weight_frac_width = frac_width
+        best_output_score = float("inf")
+        best_bias_frac_width = min(default_frac_width, bias_width - 1)
+        for data_frac_width in frac_width_candidates:
+            for weight_frac_width in frac_width_candidates:
+                bias_frac_width = min(weight_frac_width, bias_width - 1)
+                score = 0.0
+                for input_sample, output_sample in zip(input_samples, output_samples, strict=False):
+                    quantized_output = _fake_quantized_linear_output(
+                        module,
+                        input_sample=input_sample,
+                        width=width,
+                        data_frac_width=data_frac_width,
+                        weight_frac_width=weight_frac_width,
+                        bias_width=bias_width,
+                        bias_frac_width=bias_frac_width,
+                    )
+                    score += _spectral_distance(output_sample, quantized_output, num_bands=num_bands)
+                score /= len(input_samples)
+                if score < best_output_score:
+                    best_output_score = score
+                    best_data_frac_width = data_frac_width
+                    best_weight_frac_width = weight_frac_width
+                    best_bias_frac_width = bias_frac_width
 
         frac_width_by_module[module_name] = {
             "data_in_frac_width": best_data_frac_width,
             "weight_frac_width": best_weight_frac_width,
-            "bias_frac_width": min(best_weight_frac_width, bias_width - 1),
+            "bias_frac_width": best_bias_frac_width,
             "data_in_width": width,
             "weight_width": width,
             "bias_width": bias_width,
-            "data_score": best_data_score,
-            "weight_score": best_weight_score,
+            "output_spectral_score": best_output_score,
         }
 
     return frac_width_by_module

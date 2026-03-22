@@ -6,8 +6,8 @@ readme = "README.md"
 requires-python = ">=3.11.9"
 
 dependencies = [
-    "torch==2.6",
-    "torchvision",
+    "torch==2.9.1",
+    "torchvision==0.24.1",
     "onnx",
     "black",
     "toml",
@@ -82,7 +82,7 @@ dependencies = [
     # mase-triton is automatically installed on Linux x86_64
     # On other platforms, install manually if needed: pip install mase-triton
     "mase-triton>=0.0.6.post4; platform_machine == 'x86_64' and sys_platform == 'linux'",
-    "torchaudio>=2.6.0",
+    "torchaudio==2.9.1",
     "fev>=0.7.0",
     "chronos-forecasting>=2.2.2",
 ]
@@ -95,11 +95,11 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [[tool.uv.index]]
-name = "pytorch-cu126"
-url = "https://download.pytorch.org/whl/cu126"
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu126" }
-torchvision = { index = "pytorch-cu126" }
-torchaudio = { index = "pytorch-cu126" }
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+torchaudio = { index = "pytorch-cu128" }
