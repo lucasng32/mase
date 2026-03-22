@@ -1,21 +1,19 @@
 """
 Correctness and integration tests for grouped sparse attention.
 
-Compares ``FastGroupSelfAttention`` against the baseline
-``GroupSelfAttention`` for a range of group configurations to verify that
-the optimised paths (univariate, packed-sparse, triton, cuda) produce
-numerically equivalent results.
+Compares ``GroupSelfAttention`` with its inner MHA replaced by
+``GroupAwareMHA`` against the unmodified baseline for a range of group
+configurations, verifying that all dispatch paths (univariate, packed-sparse,
+triton) produce numerically equivalent results.
 """
 
 import pytest
 import torch
-import torch.nn as nn
 
 from chop.models.chronos2.configuration_chronos2 import Chronos2CoreConfig
-from chop.models.chronos2.layers import GroupSelfAttention
-from chop.models.chronos2.cuda_grouped_attn import is_cuda_ext_available
+from chop.models.chronos2.layers import GroupSelfAttention, MHA, TimeSelfAttention
 from chop.models.chronos2.optimized_layers import (
-    FastGroupSelfAttention,
+    GroupAwareMHA,
     GroupPartition,
     KernelDispatcher,
     KernelVariant,
@@ -57,6 +55,27 @@ def _make_group_time_mask(
     return gtm.to(dtype)
 
 
+def _make_optimized(
+    config: Chronos2CoreConfig,
+    baseline: GroupSelfAttention,
+    partition: GroupPartition,
+    variant: KernelVariant,
+    device: torch.device,
+) -> GroupSelfAttention:
+    """Return a GroupSelfAttention with its inner MHA replaced by GroupAwareMHA.
+
+    Copies all weights from ``baseline`` so the comparison is fair.
+    """
+    optimized = GroupSelfAttention(config).to(device).eval()
+    optimized.load_state_dict(baseline.state_dict())
+
+    group_aware = GroupAwareMHA(config, partition, variant=variant).to(device)
+    group_aware.load_state_dict(baseline.self_attention.state_dict())
+    optimized.self_attention = group_aware
+
+    return optimized
+
+
 def _run_comparison(
     config: Chronos2CoreConfig,
     group_ids: torch.Tensor,
@@ -66,30 +85,28 @@ def _run_comparison(
     T: int = 8,
     atol: float = 1e-4,
 ):
-    """Compare FastGroupSelfAttention against baseline GroupSelfAttention."""
+    """Compare optimized GroupSelfAttention against the unmodified baseline."""
     if B is None:
         B = group_ids.shape[0]
     group_ids = group_ids.to(device)
-    dtype = torch.float32
 
     baseline = GroupSelfAttention(config).to(device).eval()
     partition = GroupPartition.from_group_ids(group_ids)
-    fast = FastGroupSelfAttention(config, partition, variant=variant).to(device).eval()
-    fast.load_state_dict(baseline.state_dict(), strict=False)
+    optimized = _make_optimized(config, baseline, partition, variant, device)
 
     torch.manual_seed(42)
-    hs = torch.randn(B, T, config.d_model, device=device, dtype=dtype)
-    mask = _make_group_time_mask(group_ids, T, dtype).to(device)
+    hs = torch.randn(B, T, config.d_model, device=device, dtype=torch.float32)
+    mask = _make_group_time_mask(group_ids, T, torch.float32).to(device)
 
     with torch.no_grad():
         ref_out = baseline(hs, mask).hidden_states
-        fast_out = fast(hs, mask).hidden_states
+        opt_out = optimized(hs, mask).hidden_states
 
-    max_diff = (ref_out - fast_out).abs().max().item()
-    assert ref_out.shape == fast_out.shape, (
-        f"Shape mismatch: {ref_out.shape} vs {fast_out.shape}"
+    max_diff = (ref_out - opt_out).abs().max().item()
+    assert ref_out.shape == opt_out.shape, (
+        f"Shape mismatch: {ref_out.shape} vs {opt_out.shape}"
     )
-    assert torch.allclose(ref_out, fast_out, atol=atol), (
+    assert torch.allclose(ref_out, opt_out, atol=atol), (
         f"Outputs differ by {max_diff:.6f} (atol={atol}) "
         f"for variant={variant.name}, groups={[g.tolist() for g in partition.groups]}"
     )
@@ -140,20 +157,19 @@ class TestKernelDispatcher:
         p = GroupPartition.from_group_ids(torch.tensor([0, 0, 1, 1]))
         assert KernelDispatcher.select(p, torch.device("cpu")) == KernelVariant.PACKED_SPARSE
 
-    @pytest.mark.skipif(
-        not torch.cuda.is_available() or not is_cuda_ext_available(),
-        reason="CUDA extension not available",
-    )
-    def test_cuda_selected_when_ext_available(self):
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_cuda_small_groups_selects_packed_sparse(self):
+        # Groups below TRITON_CROSSOVER → packed sparse even on CUDA
         p = GroupPartition.from_group_ids(torch.tensor([0, 0, 1, 1]))
-        variant = KernelDispatcher.select(p, torch.device("cuda"), use_cuda_ext=True)
-        assert variant == KernelVariant.CUDA
+        variant = KernelDispatcher.select(p, torch.device("cuda"))
+        assert variant == KernelVariant.PACKED_SPARSE
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_cuda_skipped_when_disabled(self):
-        p = GroupPartition.from_group_ids(torch.tensor([0, 0, 1, 1, 2, 2, 3, 3, 4, 4]))
-        variant = KernelDispatcher.select(p, torch.device("cuda"), use_cuda_ext=False)
-        # Should fall through to Triton (if available) or packed_sparse
+    def test_cuda_large_groups_may_select_triton(self):
+        # Groups above TRITON_CROSSOVER → Triton if available, else packed sparse
+        gids = torch.tensor([0] * 10 + [1] * 10)
+        p = GroupPartition.from_group_ids(gids)
+        variant = KernelDispatcher.select(p, torch.device("cuda"))
         assert variant in (KernelVariant.TRITON, KernelVariant.PACKED_SPARSE)
 
 
@@ -215,10 +231,9 @@ class TestPackedSparseCorrectness:
         )
 
     def test_many_small_groups(self, small_config, device):
-        gids = torch.tensor([0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5])
         _run_comparison(
             small_config,
-            group_ids=gids,
+            group_ids=torch.tensor([0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5]),
             variant=KernelVariant.PACKED_SPARSE,
             device=device,
         )
@@ -279,107 +294,77 @@ class TestTritonCorrectness:
 
 
 # ---------------------------------------------------------------------------
-# Correctness: AOT CUDA kernel (CUDA + extension required)
-# ---------------------------------------------------------------------------
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or not is_cuda_ext_available(),
-    reason="CUDA extension not available",
-)
-class TestCudaCorrectness:
-    def test_uniform_pairs(self, small_config):
-        _run_comparison(
-            small_config,
-            group_ids=torch.arange(8) // 2,
-            variant=KernelVariant.CUDA,
-            device=torch.device("cuda"),
-            atol=1e-4,
-        )
-
-    def test_uniform_quads(self, small_config):
-        _run_comparison(
-            small_config,
-            group_ids=torch.arange(8) // 4,
-            variant=KernelVariant.CUDA,
-            device=torch.device("cuda"),
-            atol=1e-4,
-        )
-
-    def test_mixed_group_sizes(self, small_config):
-        _run_comparison(
-            small_config,
-            group_ids=torch.tensor([0, 0, 0, 1, 2, 2]),
-            variant=KernelVariant.CUDA,
-            device=torch.device("cuda"),
-            atol=1e-4,
-        )
-
-    def test_single_group(self, small_config):
-        _run_comparison(
-            small_config,
-            group_ids=torch.zeros(6, dtype=torch.long),
-            variant=KernelVariant.CUDA,
-            device=torch.device("cuda"),
-            atol=1e-4,
-        )
-
-    def test_larger_batch(self, small_config):
-        _run_comparison(
-            small_config,
-            group_ids=torch.arange(32) // 4,
-            variant=KernelVariant.CUDA,
-            device=torch.device("cuda"),
-            T=16,
-            atol=1e-4,
-        )
-
-    def test_univariate_group_auto_overrides_cuda(self, small_config):
-        """All-univariate input should pick UNIVARIATE even if CUDA variant is requested."""
-        partition = GroupPartition.from_group_ids(torch.arange(4))
-        fast = FastGroupSelfAttention(
-            small_config, partition, variant=KernelVariant.CUDA
-        ).to(torch.device("cuda")).eval()
-        # __init__ should have overridden variant to UNIVARIATE
-        assert fast._variant == KernelVariant.UNIVARIATE
-
-
-# ---------------------------------------------------------------------------
 # Output shape and dtype consistency
 # ---------------------------------------------------------------------------
 class TestOutputProperties:
     def test_output_shape_matches_input(self, small_config, device):
         B, T = 6, 8
-        group_ids = torch.tensor([0, 0, 1, 1, 2, 2])
+        group_ids = torch.tensor([0, 0, 1, 1, 2, 2]).to(device)
         partition = GroupPartition.from_group_ids(group_ids)
 
-        fast = FastGroupSelfAttention(
-            small_config, partition, variant=KernelVariant.PACKED_SPARSE
-        ).to(device).eval()
+        baseline = GroupSelfAttention(small_config).to(device).eval()
+        optimized = _make_optimized(
+            small_config, baseline, partition, KernelVariant.PACKED_SPARSE, device
+        )
 
         hs = torch.randn(B, T, small_config.d_model, device=device)
-        mask = _make_group_time_mask(group_ids.to(device), T, hs.dtype)
+        mask = _make_group_time_mask(group_ids, T, hs.dtype)
 
         with torch.no_grad():
-            out = fast(hs, mask).hidden_states
+            out = optimized(hs, mask).hidden_states
 
         assert out.shape == (B, T, small_config.d_model)
         assert out.dtype == hs.dtype
 
     def test_output_dtype_preserved(self, small_config, device):
         B, T = 4, 4
-        group_ids = torch.arange(B)
+        group_ids = torch.arange(B).to(device)
         partition = GroupPartition.from_group_ids(group_ids)
 
-        fast = FastGroupSelfAttention(
-            small_config, partition, variant=KernelVariant.UNIVARIATE
-        ).to(device).eval()
+        baseline = GroupSelfAttention(small_config).to(device).eval()
+        optimized = _make_optimized(
+            small_config, baseline, partition, KernelVariant.UNIVARIATE, device
+        )
 
         hs = torch.randn(B, T, small_config.d_model, device=device)
-        mask = _make_group_time_mask(group_ids.to(device), T, hs.dtype)
+        mask = _make_group_time_mask(group_ids, T, hs.dtype)
 
         with torch.no_grad():
-            out = fast(hs, mask).hidden_states
+            out = optimized(hs, mask).hidden_states
 
         assert out.dtype == hs.dtype
+
+    def test_univariate_overrides_variant(self, small_config, device):
+        """All-univariate partition should lock variant to UNIVARIATE."""
+        partition = GroupPartition.from_group_ids(torch.arange(4))
+        mha = GroupAwareMHA(small_config, partition, variant=KernelVariant.PACKED_SPARSE)
+        assert mha._variant == KernelVariant.UNIVARIATE
+
+    def test_swap_only_touches_group_self_attention(self, small_config):
+        """Replacing GroupSelfAttention.self_attention must not affect
+        the MHA inside TimeSelfAttention — they are distinct objects."""
+        group_attn = GroupSelfAttention(small_config)
+        time_attn = TimeSelfAttention(small_config)
+
+        original_time_mha = time_attn.self_attention
+        original_group_mha = group_attn.self_attention
+
+        # Simulate what the MASE pass does: swap the inner MHA of GroupSelfAttention
+        partition = GroupPartition.from_group_ids(torch.tensor([0, 0, 1, 1]))
+        group_aware = GroupAwareMHA(small_config, partition, variant=KernelVariant.PACKED_SPARSE)
+        group_aware.load_state_dict(group_attn.self_attention.state_dict())
+        group_attn.self_attention = group_aware
+
+        # GroupSelfAttention now has GroupAwareMHA
+        assert isinstance(group_attn.self_attention, GroupAwareMHA)
+
+        # TimeSelfAttention.self_attention is completely untouched
+        assert time_attn.self_attention is original_time_mha
+        assert isinstance(time_attn.self_attention, MHA)
+        assert not isinstance(time_attn.self_attention, GroupAwareMHA)
+
+        # The original GroupSelfAttention MHA is also a different object
+        assert group_attn.self_attention is not original_group_mha
 
 
 # ---------------------------------------------------------------------------
