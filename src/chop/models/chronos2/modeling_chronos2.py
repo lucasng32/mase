@@ -25,6 +25,7 @@ from .layers import (
     GroupSelfAttention,
     ResidualBlock,
     TimeSelfAttention,
+    SparseGroupSelfAttention,
 )
 from chop.models.utils import register_mase_model, register_mase_checkpoint
 from .pipeline import Chronos2Pipeline
@@ -36,6 +37,29 @@ class Chronos2EncoderBlockOutput(ModelOutput):
     time_self_attn_weights: torch.Tensor | None = None
     group_self_attn_weights: torch.Tensor | None = None
 
+def create_flattened_bsr_metadata(group_ids: torch.Tensor, time_steps: int, block_size: int = 16):
+    device = group_ids.device
+    ids_cpu = group_ids.detach().cpu()
+    
+    # 1. Sort the batch dimension
+    sorted_group_ids, sort_indices = torch.sort(ids_cpu)
+    
+    # 2. Calculate dimensions for the PADDED Mega-Batch
+    batch_size = group_ids.shape[0]
+    num_blocks_per_t = (batch_size + block_size - 1) // block_size
+    total_blocks = time_steps * num_blocks_per_t
+    
+    # 3. Create perfectly diagonal Block IDs for the entire flattened sequence
+    # Since we pad the batch, time steps never share a block. 
+    # It's just a straight line of 16x16 diagonal blocks from start to finish!
+    indptr = torch.arange(total_blocks + 1, dtype=torch.int32, device=device)
+    indices = torch.arange(total_blocks, dtype=torch.int32, device=device)
+    
+    sort_indices = sort_indices.to(device)
+    inverse_sort_indices = torch.argsort(sort_indices).to(device)
+    
+    return (sort_indices, inverse_sort_indices, indptr, indices)
+
 
 class Chronos2EncoderBlock(nn.Module):
     def __init__(self, config: Chronos2CoreConfig):
@@ -44,7 +68,11 @@ class Chronos2EncoderBlock(nn.Module):
 
         self.layer = nn.ModuleList()
         self.layer.append(TimeSelfAttention(config))
-        self.layer.append(GroupSelfAttention(config))
+        self.use_sparse = getattr(config, "use_sparse_group_attn", False)
+        if self.use_sparse:
+            self.layer.append(SparseGroupSelfAttention(config))
+        else:
+            self.layer.append(GroupSelfAttention(config))
         self.layer.append(FeedForward(config))
 
     def forward(
@@ -53,7 +81,7 @@ class Chronos2EncoderBlock(nn.Module):
         *,
         position_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        group_time_mask: torch.Tensor,
+        group_time_mask: Any, # torch.Tensor for GroupSelfAttention, tuple of tensors for SparseGroupSelfAttention
         output_attentions: bool = False,
     ) -> Chronos2EncoderBlockOutput:
         # apply time attention
@@ -65,10 +93,15 @@ class Chronos2EncoderBlock(nn.Module):
         )
         hidden_states = time_self_attn_outputs[0]
 
-        # apply group attention
-        group_self_attn_outputs: AttentionOutput = self.layer[1](
-            hidden_states, attention_mask=group_time_mask, output_attentions=output_attentions
-        )
+        # 2. Apply group attention (with dynamic routing)
+        if self.use_sparse:
+            group_self_attn_outputs: AttentionOutput = self.layer[1](
+                hidden_states, bsr_metadata=group_time_mask, output_attentions=output_attentions
+            )
+        else:
+            group_self_attn_outputs: AttentionOutput = self.layer[1](
+                hidden_states, attention_mask=group_time_mask, output_attentions=output_attentions
+            )
         hidden_states = group_self_attn_outputs[0]
 
         # apply feed forward layer
@@ -92,6 +125,8 @@ class Chronos2Encoder(nn.Module):
     def __init__(self, config: Chronos2CoreConfig):
         super().__init__()
         assert not config.is_decoder
+
+        self.use_sparse = getattr(config, "use_sparse_group_attn", False)
 
         self.block = nn.ModuleList([Chronos2EncoderBlock(config) for i in range(config.num_layers)])
         self.final_layer_norm = Chronos2LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
@@ -156,7 +191,10 @@ class Chronos2Encoder(nn.Module):
         extended_attention_mask = self._expand_and_invert_time_attention_mask(attention_mask, inputs_embeds.dtype)
 
         # construct group time mask
-        group_time_mask = self._construct_and_invert_group_time_mask(group_ids, attention_mask, inputs_embeds.dtype)
+        if self.use_sparse:
+            group_time_mask = create_flattened_bsr_metadata(group_ids, seq_length, block_size=16)
+        else:
+            group_time_mask = self._construct_and_invert_group_time_mask(group_ids, attention_mask, inputs_embeds.dtype)
 
         all_time_self_attentions: tuple[torch.Tensor, ...] = ()
         all_group_self_attentions: tuple[torch.Tensor, ...] = ()
@@ -850,10 +888,20 @@ def _get_chronos2_model(pretrained: bool = False, **kwargs) -> Chronos2Model:
     model_id = _resolve_chronos2_model_id(load_kwargs)
     _drop_mase_only_kwargs(load_kwargs)
 
+    # 1. Build the config using ALL provided kwargs (including our custom flags)
     config = Chronos2CoreConfig.from_pretrained(model_id, **load_kwargs)
+    
+    # 2. Build our custom model architecture
     model = Chronos2Model(config)
+    
     if pretrained:
-        pipeline = Chronos2Pipeline.from_pretrained(model_id, **load_kwargs)
+        # 3. Strip out the custom flags so HuggingFace's pipeline doesn't panic
+        hf_pipeline_kwargs = dict(load_kwargs)
+        hf_pipeline_kwargs.pop("use_sparse_group_attn", None)
+        hf_pipeline_kwargs.pop("_attn_implementation", None)
+        
+        # 4. Load the weights using the cleaned kwargs
+        pipeline = Chronos2Pipeline.from_pretrained(model_id, **hf_pipeline_kwargs)
         model.load_state_dict(pipeline.model.state_dict(), strict=False)
 
     return model

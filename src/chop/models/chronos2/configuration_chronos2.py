@@ -41,6 +41,8 @@ class Chronos2CoreConfig(PretrainedConfig):
         The base theta for rotary position embedding (RoPE), by default 10000.0
     attn_implementation
         The attention implementation to use. Options: "eager" or "sdpa", by default None (uses "sdpa")
+    use_sparse_group_attn
+        Whether to use sparse group attention, by default False. If True, the model will be initialized with sparse group attention and should be fine-tuned with it as well.
     """
 
     model_type = "t5"
@@ -66,6 +68,7 @@ class Chronos2CoreConfig(PretrainedConfig):
         pad_token_id: int = 0,
         rope_theta: float = 10000.0,
         attn_implementation: Literal["eager", "sdpa"] | None = None,
+        use_sparse_group_attn: bool = False,
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -79,7 +82,7 @@ class Chronos2CoreConfig(PretrainedConfig):
         self.initializer_factor = initializer_factor
         self.feed_forward_proj = feed_forward_proj
         self.rope_theta = rope_theta
-
+        self.use_sparse_group_attn = use_sparse_group_attn
         act_info = self.feed_forward_proj.split("-")
         self.dense_act_fn = act_info[-1]
         self.is_gated_act = act_info[0] == "gated"

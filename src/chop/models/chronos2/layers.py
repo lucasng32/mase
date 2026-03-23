@@ -14,6 +14,8 @@ from transformers.utils import ModelOutput
 
 from .configuration_chronos2 import Chronos2CoreConfig
 
+import flashinfer
+
 
 class RoPE(nn.Module):
     """Applies rotary position embeddings (RoPE) to input tensors.
@@ -375,6 +377,106 @@ class GroupSelfAttention(nn.Module):
         hidden_states = hidden_states.transpose(0, 1)
 
         return AttentionOutput(hidden_states=hidden_states, attn_weights=attention_output.attn_weights)
+    
+class SparseGroupSelfAttention(nn.Module):
+    """
+    Block-Sparse Self-attention applied along the batch axis using FlashInfer.
+    Replaces the standard GroupSelfAttention to handle dynamic group IDs efficiently.
+    """
+    def __init__(self, config: Chronos2CoreConfig):
+        super().__init__()
+        self.d_model = config.d_model
+        self.kv_proj_dim = config.d_kv
+        self.n_heads = config.num_heads
+        self.inner_dim = self.n_heads * self.kv_proj_dim
+        
+        # Projections
+        self.q = nn.Linear(self.d_model, self.inner_dim, bias=False)
+        self.k = nn.Linear(self.d_model, self.inner_dim, bias=False)
+        self.v = nn.Linear(self.d_model, self.inner_dim, bias=False)
+        self.o = nn.Linear(self.inner_dim, self.d_model, bias=False)
+
+        self.layer_norm = Chronos2LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
+        self.dropout = nn.Dropout(config.dropout_rate)
+        
+        # Initialize FlashInfer BSR Wrapper
+        # 32MB workspace is usually plenty for partial outputs
+        self.register_buffer("workspace_buffer", torch.empty(32 * 1024 * 1024, dtype=torch.int8), persistent=False)
+        self.attention_wrapper = flashinfer.BlockSparseAttentionWrapper(self.workspace_buffer)
+
+    def forward(
+        self, hidden_states: torch.Tensor, bsr_metadata: tuple, output_attentions: bool = False
+    ) -> AttentionOutput:
+        # 1. Self-healing Device Check
+        if not hasattr(self, "_current_device") or self._current_device != hidden_states.device:
+            self._current_device = hidden_states.device
+            self.attention_wrapper = flashinfer.BlockSparseAttentionWrapper(
+                self.workspace_buffer.to(self._current_device)
+            )
+
+        sort_indices, inverse_sort_indices, flat_indptr, flat_indices = bsr_metadata
+        
+        # Chronos-2 axes: (batch, time, d_model) -> (time, batch, d_model)
+        hidden_states = hidden_states.transpose(0, 1)
+        normed_states = self.layer_norm(hidden_states)
+        T, B, D = normed_states.shape
+        
+        # 2. Project -> (Time, Batch, Heads, Head_Dim)
+        q = self.q(normed_states).view(T, B, self.n_heads, -1)
+        k = self.k(normed_states).view(T, B, self.n_heads, -1)
+        v = self.v(normed_states).view(T, B, self.n_heads, -1)
+
+        # Sort the batch dimension
+        q_sorted = q[:, sort_indices, :, :]
+        k_sorted = k[:, sort_indices, :, :]
+        v_sorted = v[:, sort_indices, :, :]
+
+        # 3. PAD the batch dimension to a multiple of 16
+        R, C = 16, 16
+        pad_len = (R - (B % R)) % R
+        if pad_len > 0:
+            padding = torch.zeros((T, pad_len, self.n_heads, self.kv_proj_dim), device=q.device, dtype=q.dtype)
+            q_sorted = torch.cat([q_sorted, padding], dim=1)
+            k_sorted = torch.cat([k_sorted, padding], dim=1)
+            v_sorted = torch.cat([v_sorted, padding], dim=1)
+
+        # 4. FLATTEN into the Mega-Batch: (T * Padded_B, Heads, Head_Dim)
+        q_flat = q_sorted.reshape(-1, self.n_heads, self.kv_proj_dim).contiguous()
+        k_flat = k_sorted.reshape(-1, self.n_heads, self.kv_proj_dim).contiguous()
+        v_flat = v_sorted.reshape(-1, self.n_heads, self.kv_proj_dim).contiguous()
+
+        # 5. Plan and Execute (NO LOOP!)
+        M_flat = (flat_indptr.shape[0] - 1) * R
+        
+        self.attention_wrapper.plan(
+            indptr=flat_indptr, 
+            indices=flat_indices, 
+            M=M_flat, N=M_flat, R=R, C=C,
+            num_qo_heads=self.n_heads,
+            num_kv_heads=self.n_heads,
+            head_dim=self.kv_proj_dim,
+            sm_scale=1.0, 
+            causal=False,
+            pos_encoding_mode="NONE" 
+        )
+
+        attn_out_flat = self.attention_wrapper.run(q_flat, k_flat, v_flat)
+
+        # 6. Un-flatten, Un-pad, and Un-sort
+        # Reshape back to (Time, Padded_B, Heads * Head_Dim)
+        attn_out = attn_out_flat.view(T, B + pad_len, self.inner_dim)
+        
+        # Slice off the padding
+        attn_out = attn_out[:, :B, :]
+        
+        # Restore original batch order
+        attn_out = attn_out[:, inverse_sort_indices, :]
+
+        # 7. Final Projection
+        attn_out = self.o(attn_out)
+        hidden_states = (hidden_states + self.dropout(attn_out)).transpose(0, 1)
+
+        return AttentionOutput(hidden_states=hidden_states, attn_weights=None)
 
 
 class ResidualBlock(nn.Module):
