@@ -34,6 +34,7 @@ from chop.models.chronos2.optimized_layers import (
     GroupPartition,
     KernelDispatcher,
     KernelVariant,
+    UnivariateGroupAwareMHA,
 )
 
 logger = logging.getLogger(__name__)
@@ -70,13 +71,13 @@ class GroupAttentionAnalyser:
             module = mg.model.get_submodule(node.target)
             if not isinstance(module, GroupSelfAttention):
                 continue
-            if isinstance(module.self_attention, GroupAwareMHA):
+            if isinstance(module.self_attention, (GroupAwareMHA, UnivariateGroupAwareMHA)):
                 results.append(
                     GroupAttentionInfo(
                         node_name=node.name,
                         module_path=node.target,
                         can_optimise=False,
-                        reason="Inner MHA already replaced with GroupAwareMHA",
+                        reason="Inner MHA already replaced with GroupAwareMHA or UnivariateGroupAwareMHA",
                     )
                 )
             else:
@@ -147,23 +148,38 @@ def fast_group_attention_transform_pass(
         module: GroupSelfAttention = mg.model.get_submodule(info.module_path)
         device = next(module.parameters()).device
 
-        variant = forced_variant or KernelDispatcher.select(partition, device)
-        logger.info(
-            "Replacing self_attention in %s with GroupAwareMHA (variant=%s)",
-            info.module_path,
-            variant.name,
-        )
+        if partition.all_univariate:
+            # All groups are size 1: attention output is always V.
+            # The pass handles this at compile time — no kernel dispatch needed.
+            logger.info(
+                "Replacing self_attention in %s with UnivariateGroupAwareMHA",
+                info.module_path,
+            )
+            new_mha = UnivariateGroupAwareMHA(config=module.self_attention.config)
+            mha_sd = module.self_attention.state_dict()
+            new_mha.load_state_dict(
+                {k: v for k, v in mha_sd.items() if k in ("v.weight", "o.weight")}
+            )
+            variant_name = "UNIVARIATE"
+        else:
+            variant = forced_variant or KernelDispatcher.select(partition, device)
+            logger.info(
+                "Replacing self_attention in %s with GroupAwareMHA (variant=%s)",
+                info.module_path,
+                variant.name,
+            )
+            new_mha = GroupAwareMHA(
+                config=module.self_attention.config,
+                partition=partition,
+                variant=variant,
+            )
+            new_mha.load_state_dict(module.self_attention.state_dict())
+            variant_name = variant.name
 
-        group_aware_mha = GroupAwareMHA(
-            config=module.self_attention.config,
-            partition=partition,
-            variant=variant,
-        )
-        group_aware_mha.load_state_dict(module.self_attention.state_dict())
-        group_aware_mha.to(device)
+        new_mha.to(device)
 
         # Swap the inner MHA — outer GroupSelfAttention is untouched
-        module.self_attention = group_aware_mha
+        module.self_attention = new_mha
 
         # Write metadata for downstream passes
         node = _find_node_by_target(mg, info.module_path)
@@ -171,7 +187,7 @@ def fast_group_attention_transform_pass(
             ts_meta = node.meta["mase"].parameters.setdefault("timeseries", {})
             ts_meta["group_ids"] = group_ids.cpu()
             ts_meta["partition"] = partition
-            ts_meta["kernel_variant"] = variant.name
+            ts_meta["kernel_variant"] = variant_name
 
         replaced += 1
 
