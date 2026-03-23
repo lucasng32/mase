@@ -40,8 +40,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .configuration_chronos2 import Chronos2CoreConfig
-from .layers import AttentionOutput
+from .layers import AttentionOutput, RoPE
 from .triton_grouped_attn import is_triton_available, triton_grouped_attention
+from .triton_rope_attn import (
+    is_triton_available as _rope_triton_available,
+    triton_fused_rope_attention,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -336,3 +340,197 @@ class GroupAwareMHA(nn.Module):
         attn_out = self.o(attn_out).reshape(T, G * M, d)
 
         return attn_out[:, self._real_flat_idx, :]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RoPEFusedMHA
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class RoPEFusedMHA(nn.Module):
+    """Drop-in replacement for ``MHA`` inside ``TimeSelfAttention``.
+
+    Fuses the RoPE rotation into the attention kernel so that rotated Q and K
+    tensors are **never materialised in global memory**.
+
+    Two dispatch paths (chosen once at construction, no runtime branching):
+
+    1. **Triton** (CUDA + Triton available):
+         A single Triton kernel applies RoPE in-register while streaming
+         over K/V tiles with an online softmax — identical result to the
+         reference path at much lower memory bandwidth.
+
+    2. **PyTorch eager** (CPU or Triton unavailable):
+         Computes cos/sin once per forward, applies RoPE with in-place-safe
+         operations, then calls standard eager attention.  Slightly cheaper
+         than the original ``MHA`` path because cos/sin are computed once
+         (not inside ``RoPE.forward`` which re-expands ``inv_freq`` every
+         call).
+
+    Weight keys (q/k/v/o and rope_embed.inv_freq) match ``MHA`` exactly so
+    ``load_state_dict(mha.state_dict(), strict=False)`` transfers all
+    learnable parameters from an existing ``MHA`` instance.  ``inv_freq`` is
+    a non-persistent buffer and is not in the state dict.
+    """
+
+    def __init__(self, config: Chronos2CoreConfig):
+        super().__init__()
+
+        self.d_model: int = config.d_model
+        self.kv_proj_dim: int = config.d_kv
+        self.n_heads: int = config.num_heads
+        self.dropout: float = config.dropout_rate
+        self.inner_dim: int = self.n_heads * self.kv_proj_dim
+        self.config = config
+
+        self.q = nn.Linear(self.d_model, self.inner_dim, bias=False)
+        self.k = nn.Linear(self.d_model, self.inner_dim, bias=False)
+        self.v = nn.Linear(self.d_model, self.inner_dim, bias=False)
+        self.o = nn.Linear(self.inner_dim, self.d_model, bias=False)
+
+        # inv_freq matches RoPE.inv_freq exactly (same formula)
+        inv_freq = 1.0 / (
+            config.rope_theta
+            ** (
+                torch.arange(0, self.kv_proj_dim, 2, dtype=torch.int64).float()
+                / self.kv_proj_dim
+            )
+        )
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+        # Dispatch: use Triton on CUDA when available
+        self._use_triton: bool = _rope_triton_available()
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _compute_rope(
+        self, position_ids: torch.Tensor, dtype: torch.dtype
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute cos/sin tables for the given position_ids.
+
+        Returns:
+            cos, sin — both shape ``(B, S, D)`` (head dim D = kv_proj_dim).
+        """
+        inv_freq = self.inv_freq.to(position_ids.device)
+        # (B, D/2, 1) x (B, 1, S) → (B, D/2, S) → (B, S, D/2)
+        inv_freq_exp = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        pos_exp = position_ids[:, None, :].float()
+        freqs = (inv_freq_exp @ pos_exp).transpose(1, 2)          # (B, S, D/2)
+        emb = torch.cat((freqs, freqs), dim=-1)                    # (B, S, D)
+        return emb.cos().to(dtype), emb.sin().to(dtype)
+
+    @staticmethod
+    def _eager_rope_attn(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        mask: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        dropout_p: float,
+        training: bool,
+    ) -> torch.Tensor:
+        """Apply RoPE then eager attention. All tensors in (B, H, S, D) form."""
+        # cos/sin: (B, S, D) → unsqueeze head dim → (B, 1, S, D)
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+
+        def rotate_half(x: torch.Tensor) -> torch.Tensor:
+            h = x.shape[-1] // 2
+            return torch.cat((-x[..., h:], x[..., :h]), dim=-1)
+
+        q = q * cos + rotate_half(q) * sin
+        k = k * cos + rotate_half(k) * sin
+
+        scores = torch.matmul(q, k.transpose(-1, -2)) + mask
+        attn_weights = F.softmax(scores.float(), dim=-1).type_as(scores)
+        attn_weights = F.dropout(attn_weights, p=dropout_p, training=training)
+        return torch.matmul(attn_weights, v)
+
+    # ------------------------------------------------------------------
+    # Forward — identical signature to MHA.forward()
+    # ------------------------------------------------------------------
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        mask: torch.Tensor,
+        encoder_states: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        output_attentions: bool = False,
+    ) -> AttentionOutput:
+        """Fused RoPE + time-attention forward.
+
+        Args:
+            hidden_states: ``(B, S, d_model)``
+            mask:          ``(B, 1, S, S)`` additive attention mask
+            encoder_states: not used (``TimeSelfAttention`` is self-attention only)
+            position_ids:  ``(B, S)`` integer position indices
+            output_attentions: if True, fall back to eager path that returns weights
+        """
+        assert position_ids is not None, "position_ids must be provided for RoPEFusedMHA"
+        B, S, _ = hidden_states.shape
+        H, D = self.n_heads, self.kv_proj_dim
+
+        def _shape(x: torch.Tensor) -> torch.Tensor:
+            """(B, S, inner_dim) → (B, H, S, D)"""
+            return x.view(B, S, H, D).transpose(1, 2)
+
+        def _unshape(x: torch.Tensor) -> torch.Tensor:
+            """(B, H, S, D) → (B, S, inner_dim)"""
+            return x.transpose(1, 2).reshape(B, S, self.inner_dim)
+
+        q = _shape(self.q(hidden_states))    # (B, H, S, D)
+        k = _shape(self.k(hidden_states))
+        v = _shape(self.v(hidden_states))
+
+        if self._use_triton and not output_attentions and hidden_states.is_cuda:
+            # Triton path: RoPE fused into the attention kernel
+            inv_freq_device = self.inv_freq.to(hidden_states.device)
+            # position_ids may be (1, S) — broadcast to (B, S)
+            if position_ids.shape[0] == 1 and B > 1:
+                position_ids = position_ids.expand(B, -1)
+            # Triton kernel expects inv_freq indexed by absolute position, so
+            # we pre-scale: freqs[pos] = pos * inv_freq[i]
+            # The kernel uses q_range (absolute token index) as position, but
+            # actual position_ids may be non-contiguous (e.g. after padding).
+            # For TimeSelfAttention position_ids = arange(0, S) (default in
+            # Chronos2Encoder.forward), so the kernel's q_range == position_ids.
+            # Fall back to eager when position_ids is non-standard.
+            if torch.equal(
+                position_ids[0],
+                torch.arange(S, device=position_ids.device, dtype=position_ids.dtype),
+            ):
+                # mask: (B, 1, S, S) — contiguous required for stride access
+                mask_c = mask.contiguous()
+                q_c = q.contiguous()
+                k_c = k.contiguous()
+                v_c = v.contiguous()
+                attn_out = triton_fused_rope_attention(q_c, k_c, v_c, mask_c, inv_freq_device)
+                attn_out = _unshape(attn_out)
+                return AttentionOutput(hidden_states=self.o(attn_out), attn_weights=None)
+            # Non-contiguous positions — fall through to eager
+
+        # PyTorch eager path (CPU / output_attentions / non-contiguous positions)
+        cos, sin = self._compute_rope(position_ids, hidden_states.dtype)
+        attn_out = self._eager_rope_attn(q, k, v, mask, cos, sin, self.dropout, self.training)
+        attn_out = _unshape(attn_out)
+
+        attn_weights_out = None
+        if output_attentions:
+            # Re-run to get weights (cheap since Q/K are already computed above;
+            # we recompute here to keep the forward path branchless for the
+            # common no-weights case)
+            cos_h = cos.unsqueeze(1)
+            sin_h = sin.unsqueeze(1)
+
+            def rotate_half(x: torch.Tensor) -> torch.Tensor:
+                h = x.shape[-1] // 2
+                return torch.cat((-x[..., h:], x[..., :h]), dim=-1)
+
+            q_rot = q * cos_h + rotate_half(q) * sin_h
+            k_rot = k * cos_h + rotate_half(k) * sin_h
+            scores = torch.matmul(q_rot, k_rot.transpose(-1, -2)) + mask
+            attn_weights_out = F.softmax(scores.float(), dim=-1).type_as(scores)
+
+        return AttentionOutput(hidden_states=self.o(attn_out), attn_weights=attn_weights_out)
