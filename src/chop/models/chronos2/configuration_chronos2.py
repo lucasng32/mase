@@ -69,6 +69,7 @@ class Chronos2CoreConfig(PretrainedConfig):
         rope_theta: float = 10000.0,
         attn_implementation: Literal["eager", "sdpa"] | None = None,
         use_sparse_group_attn: bool = False,
+        group_attn_backend: str = "dense",
         **kwargs,
     ):
         self.vocab_size = vocab_size
@@ -83,6 +84,7 @@ class Chronos2CoreConfig(PretrainedConfig):
         self.feed_forward_proj = feed_forward_proj
         self.rope_theta = rope_theta
         self.use_sparse_group_attn = use_sparse_group_attn
+        self.group_attn_backend = group_attn_backend
         act_info = self.feed_forward_proj.split("-")
         self.dense_act_fn = act_info[-1]
         self.is_gated_act = act_info[0] == "gated"

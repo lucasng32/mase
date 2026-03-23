@@ -39,26 +39,98 @@ class Chronos2EncoderBlockOutput(ModelOutput):
 
 def create_flattened_bsr_metadata(group_ids: torch.Tensor, time_steps: int, block_size: int = 16):
     device = group_ids.device
-    ids_cpu = group_ids.detach().cpu()
     
-    # 1. Sort the batch dimension
-    sorted_group_ids, sort_indices = torch.sort(ids_cpu)
+    # 1. Sort group IDs to group identical items together
+    sorted_group_ids, sort_indices = torch.sort(group_ids)
     
-    # 2. Calculate dimensions for the PADDED Mega-Batch
+    # 2. Calculate dimensions for the TOTAL PADDED Batch
     batch_size = group_ids.shape[0]
     num_blocks_per_t = (batch_size + block_size - 1) // block_size
-    total_blocks = time_steps * num_blocks_per_t
+    padded_batch_size = num_blocks_per_t * block_size
     
-    # 3. Create perfectly diagonal Block IDs for the entire flattened sequence
-    # Since we pad the batch, time steps never share a block. 
-    # It's just a straight line of 16x16 diagonal blocks from start to finish!
-    indptr = torch.arange(total_blocks + 1, dtype=torch.int32, device=device)
-    indices = torch.arange(total_blocks, dtype=torch.int32, device=device)
+    # 3. Correct BSR Structure: "Block-Dense" within each group
+    # We must find which blocks each group touches.
+    unique_groups, counts = torch.unique_consecutive(sorted_group_ids, return_counts=True)
     
-    sort_indices = sort_indices.to(device)
-    inverse_sort_indices = torch.argsort(sort_indices).to(device)
+    group_offsets = torch.cat([torch.tensor([0], device=device), counts.cumsum(0)[:-1]])
+    group_starts = group_offsets
+    group_ends = group_offsets + counts
     
-    return (sort_indices, inverse_sort_indices, indptr, indices)
+    group_block_starts = group_starts // block_size
+    group_block_ends = (group_ends - 1) // block_size
+    
+    # Build the block adjacency list
+    adj = [set() for _ in range(num_blocks_per_t)]
+    for bs, be in zip(group_block_starts.tolist(), group_block_ends.tolist()):
+        for r in range(bs, be + 1):
+            for c in range(bs, be + 1):
+                adj[r].add(c)
+    
+    indptr_list = [0]
+    indices_list = []
+    curr = 0
+    for r in range(num_blocks_per_t):
+        sorted_cols = sorted(list(adj[r]))
+        indices_list.extend(sorted_cols)
+        curr += len(sorted_cols)
+        indptr_list.append(curr)
+        
+    indptr_single_t = torch.tensor(indptr_list, dtype=torch.int32, device=device)
+    indices_single_t = torch.tensor(indices_list, dtype=torch.int32, device=device)
+    
+    # 4. Repeat and shift for all time steps
+    edges_per_t = curr
+    if time_steps > 1:
+        shift_idx = torch.arange(time_steps, device=device) * num_blocks_per_t
+        indices = indices_single_t.unsqueeze(0) + shift_idx.unsqueeze(1)
+        indices = indices.view(-1)
+        
+        shift_indptr = torch.arange(time_steps, device=device) * edges_per_t
+        indptr = indptr_single_t[:-1].unsqueeze(0) + shift_indptr.unsqueeze(1)
+        indptr = indptr.view(-1)
+        indptr = torch.cat([indptr, torch.tensor([time_steps * edges_per_t], dtype=torch.int32, device=device)])
+    else:
+        indices = indices_single_t
+        indptr = indptr_single_t
+    
+    # 5. Create valid_mask and padded_sorted_group_ids
+    valid_mask = torch.zeros(padded_batch_size, dtype=torch.bool, device=device)
+    valid_mask[:batch_size] = True
+    
+    padded_sorted_group_ids = torch.full((padded_batch_size,), -1, dtype=torch.long, device=device)
+    padded_sorted_group_ids[:batch_size] = sorted_group_ids
+    
+    # Repeat for all time steps
+    valid_mask = valid_mask.unsqueeze(0).expand(time_steps, -1).reshape(-1)
+    padded_sorted_group_ids = padded_sorted_group_ids.unsqueeze(0).expand(time_steps, -1).reshape(-1)
+    
+    return sort_indices, valid_mask, padded_sorted_group_ids, indptr, indices
+
+def create_ragged_metadata(group_ids: torch.Tensor, time_steps: int):
+    # Sort group IDs to group identical items together
+    sorted_group_ids, sort_indices = torch.sort(group_ids)
+    
+    # Calculate sizes of each unique group
+    unique_groups, counts = torch.unique_consecutive(sorted_group_ids, return_counts=True)
+    
+    # Create the cumulative sequence lengths (indptr)
+    indptr_single_t = torch.cat([
+        torch.tensor([0], device=counts.device), 
+        counts.cumsum(0)
+    ]).to(torch.int32)
+    
+    # Repeat pointer logic for all time steps
+    batch_size = group_ids.shape[0]
+    offsets = torch.arange(time_steps, device=counts.device, dtype=torch.int32) * batch_size
+    
+    full_indptr = indptr_single_t.unsqueeze(0) + offsets.unsqueeze(1)
+    flat_indptr = torch.unique(full_indptr.view(-1)).to(torch.int32)
+
+    inverse_sort_indices = torch.argsort(sort_indices)
+    
+    # Crucial for small batches: Move indptr to CPU before returning 
+    # so FlashInfer's plan() doesn't trigger a blocking device-to-host sync.
+    return sort_indices, inverse_sort_indices, flat_indptr.cpu()
 
 
 class Chronos2EncoderBlock(nn.Module):
@@ -68,8 +140,17 @@ class Chronos2EncoderBlock(nn.Module):
 
         self.layer = nn.ModuleList()
         self.layer.append(TimeSelfAttention(config))
-        self.use_sparse = getattr(config, "use_sparse_group_attn", False)
-        if self.use_sparse:
+        # Read the backend preference
+        self.group_attn_backend = getattr(config, "group_attn_backend", "dense")
+        
+        # Backwards compatibility for the old boolean flag
+        if getattr(config, "use_sparse_group_attn", False) and self.group_attn_backend == "dense":
+            self.group_attn_backend = "bsr"
+
+        if self.group_attn_backend == "ragged":
+            from .layers import RaggedGroupSelfAttention
+            self.layer.append(RaggedGroupSelfAttention(config))
+        elif self.group_attn_backend == "bsr":
             self.layer.append(SparseGroupSelfAttention(config))
         else:
             self.layer.append(GroupSelfAttention(config))
@@ -93,8 +174,12 @@ class Chronos2EncoderBlock(nn.Module):
         )
         hidden_states = time_self_attn_outputs[0]
 
-        # 2. Apply group attention (with dynamic routing)
-        if self.use_sparse:
+        # 2. Apply group attention (with dynamic backend routing)
+        if self.group_attn_backend == "ragged":
+            group_self_attn_outputs: AttentionOutput = self.layer[1](
+                hidden_states, ragged_metadata=group_time_mask, output_attentions=output_attentions
+            )
+        elif self.group_attn_backend == "bsr":
             group_self_attn_outputs: AttentionOutput = self.layer[1](
                 hidden_states, bsr_metadata=group_time_mask, output_attentions=output_attentions
             )
@@ -126,7 +211,9 @@ class Chronos2Encoder(nn.Module):
         super().__init__()
         assert not config.is_decoder
 
-        self.use_sparse = getattr(config, "use_sparse_group_attn", False)
+        self.group_attn_backend = getattr(config, "group_attn_backend", "dense")
+        if getattr(config, "use_sparse_group_attn", False) and self.group_attn_backend == "dense":
+            self.group_attn_backend = "bsr"
 
         self.block = nn.ModuleList([Chronos2EncoderBlock(config) for i in range(config.num_layers)])
         self.final_layer_norm = Chronos2LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
@@ -191,7 +278,9 @@ class Chronos2Encoder(nn.Module):
         extended_attention_mask = self._expand_and_invert_time_attention_mask(attention_mask, inputs_embeds.dtype)
 
         # construct group time mask
-        if self.use_sparse:
+        if self.group_attn_backend == "ragged":
+            group_time_mask = create_ragged_metadata(group_ids, seq_length)
+        elif self.group_attn_backend == "bsr":
             group_time_mask = create_flattened_bsr_metadata(group_ids, seq_length, block_size=16)
         else:
             group_time_mask = self._construct_and_invert_group_time_mask(group_ids, attention_mask, inputs_embeds.dtype)
@@ -895,14 +984,27 @@ def _get_chronos2_model(pretrained: bool = False, **kwargs) -> Chronos2Model:
     model = Chronos2Model(config)
     
     if pretrained:
-        # 3. Strip out the custom flags so HuggingFace's pipeline doesn't panic
         hf_pipeline_kwargs = dict(load_kwargs)
         hf_pipeline_kwargs.pop("use_sparse_group_attn", None)
+        hf_pipeline_kwargs.pop("group_attn_backend", None) # Strip the new flag here
         hf_pipeline_kwargs.pop("_attn_implementation", None)
-        
+
         # 4. Load the weights using the cleaned kwargs
         pipeline = Chronos2Pipeline.from_pretrained(model_id, **hf_pipeline_kwargs)
-        model.load_state_dict(pipeline.model.state_dict(), strict=False)
+        
+        state_dict = pipeline.model.state_dict()
+        
+        # Remap state dict for sparse/ragged attention layers
+        if getattr(config, "group_attn_backend", "dense") in ["bsr", "ragged"]:
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                if "layer.1.self_attention" in k:
+                    new_state_dict[k.replace("layer.1.self_attention", "layer.1")] = v
+                else:
+                    new_state_dict[k] = v
+            state_dict = new_state_dict
+            
+        model.load_state_dict(state_dict, strict=False)
 
     return model
 
