@@ -17,6 +17,7 @@ from chop.models.chronos2.optimized_layers import (
     GroupPartition,
     KernelDispatcher,
     KernelVariant,
+    UnivariateGroupAwareMHA,
 )
 
 
@@ -149,49 +150,61 @@ class TestGroupPartition:
 # KernelDispatcher tests
 # ---------------------------------------------------------------------------
 class TestKernelDispatcher:
-    def test_univariate_always_selected(self):
-        p = GroupPartition.from_group_ids(torch.arange(4))
-        assert KernelDispatcher.select(p, torch.device("cpu")) == KernelVariant.UNIVARIATE
-
     def test_cpu_selects_packed_sparse(self):
         p = GroupPartition.from_group_ids(torch.tensor([0, 0, 1, 1]))
         assert KernelDispatcher.select(p, torch.device("cpu")) == KernelVariant.PACKED_SPARSE
 
+    def test_univariate_on_cpu_selects_packed_sparse(self):
+        # Univariate is handled by the pass, not the dispatcher.
+        # On CPU the dispatcher falls through to PACKED_SPARSE regardless.
+        p = GroupPartition.from_group_ids(torch.arange(4))
+        assert KernelDispatcher.select(p, torch.device("cpu")) == KernelVariant.PACKED_SPARSE
+
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_cuda_small_groups_selects_packed_sparse(self):
-        # Groups below TRITON_CROSSOVER → packed sparse even on CUDA
+    def test_cuda_selects_triton_bucketed(self):
         p = GroupPartition.from_group_ids(torch.tensor([0, 0, 1, 1]))
         variant = KernelDispatcher.select(p, torch.device("cuda"))
-        assert variant == KernelVariant.PACKED_SPARSE
-
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_cuda_large_groups_may_select_triton(self):
-        # Groups above TRITON_CROSSOVER → Triton if available, else packed sparse
-        gids = torch.tensor([0] * 10 + [1] * 10)
-        p = GroupPartition.from_group_ids(gids)
-        variant = KernelDispatcher.select(p, torch.device("cuda"))
-        assert variant in (KernelVariant.TRITON, KernelVariant.PACKED_SPARSE)
+        assert variant in (KernelVariant.TRITON_BUCKETED, KernelVariant.PACKED_SPARSE)
 
 
 # ---------------------------------------------------------------------------
-# Correctness: univariate (all groups size 1)
+# Correctness: univariate (all groups size 1) — via UnivariateGroupAwareMHA
 # ---------------------------------------------------------------------------
 class TestUnivariateCorrectness:
-    def test_small_batch(self, small_config, device):
-        _run_comparison(
-            small_config,
-            group_ids=torch.arange(4),
-            variant=KernelVariant.UNIVARIATE,
-            device=device,
+    def _run_univariate_comparison(self, config, group_ids, device, T=8, atol=1e-4):
+        """Compare UnivariateGroupAwareMHA against the unmodified baseline."""
+        group_ids = group_ids.to(device)
+        B = group_ids.shape[0]
+
+        baseline = GroupSelfAttention(config).to(device).eval()
+
+        optimized = GroupSelfAttention(config).to(device).eval()
+        optimized.load_state_dict(baseline.state_dict())
+        mha_sd = baseline.self_attention.state_dict()
+        univ_mha = UnivariateGroupAwareMHA(config).to(device)
+        univ_mha.load_state_dict(
+            {k: v for k, v in mha_sd.items() if k in ("v.weight", "o.weight")}
+        )
+        optimized.self_attention = univ_mha
+
+        torch.manual_seed(42)
+        hs = torch.randn(B, T, config.d_model, device=device)
+        mask = _make_group_time_mask(group_ids, T, torch.float32).to(device)
+
+        with torch.no_grad():
+            ref = baseline(hs, mask).hidden_states
+            out = optimized(hs, mask).hidden_states
+
+        assert ref.shape == out.shape
+        assert torch.allclose(ref, out, atol=atol), (
+            f"max_diff={(ref-out).abs().max():.6f}"
         )
 
+    def test_small_batch(self, small_config, device):
+        self._run_univariate_comparison(small_config, torch.arange(4), device)
+
     def test_medium_batch(self, small_config, device):
-        _run_comparison(
-            small_config,
-            group_ids=torch.arange(16),
-            variant=KernelVariant.UNIVARIATE,
-            device=device,
-        )
+        self._run_univariate_comparison(small_config, torch.arange(16), device)
 
 
 # ---------------------------------------------------------------------------
@@ -319,12 +332,16 @@ class TestOutputProperties:
     def test_output_dtype_preserved(self, small_config, device):
         B, T = 4, 4
         group_ids = torch.arange(B).to(device)
-        partition = GroupPartition.from_group_ids(group_ids)
 
         baseline = GroupSelfAttention(small_config).to(device).eval()
-        optimized = _make_optimized(
-            small_config, baseline, partition, KernelVariant.UNIVARIATE, device
+        optimized = GroupSelfAttention(small_config).to(device).eval()
+        optimized.load_state_dict(baseline.state_dict())
+        mha_sd = baseline.self_attention.state_dict()
+        univ_mha = UnivariateGroupAwareMHA(small_config).to(device)
+        univ_mha.load_state_dict(
+            {k: v for k, v in mha_sd.items() if k in ("v.weight", "o.weight")}
         )
+        optimized.self_attention = univ_mha
 
         hs = torch.randn(B, T, small_config.d_model, device=device)
         mask = _make_group_time_mask(group_ids, T, hs.dtype)
@@ -334,11 +351,14 @@ class TestOutputProperties:
 
         assert out.dtype == hs.dtype
 
-    def test_univariate_overrides_variant(self, small_config, device):
-        """All-univariate partition should lock variant to UNIVARIATE."""
+    def test_univariate_handled_at_pass_not_runtime(self, small_config):
+        """KernelDispatcher no longer has a UNIVARIATE variant — the pass
+        creates UnivariateGroupAwareMHA directly."""
+        assert not hasattr(KernelVariant, "UNIVARIATE")
         partition = GroupPartition.from_group_ids(torch.arange(4))
+        # GroupAwareMHA with PACKED_SPARSE should NOT silently override to UNIVARIATE
         mha = GroupAwareMHA(small_config, partition, variant=KernelVariant.PACKED_SPARSE)
-        assert mha._variant == KernelVariant.UNIVARIATE
+        assert mha._variant == KernelVariant.PACKED_SPARSE
 
     def test_swap_only_touches_group_self_attention(self, small_config):
         """Replacing GroupSelfAttention.self_attention must not affect
