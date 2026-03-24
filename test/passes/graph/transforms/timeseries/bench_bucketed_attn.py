@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Benchmark: TRITON_BUCKETED vs TRITON (single-launch) vs PACKED_SPARSE.
+Benchmark: GroupSelfAttention baseline vs fast_group_attention_transform_pass.
 
-Focuses on the cases where bucketed dispatch is expected to win:
-  - Mixed group sizes (multiple occupied buckets)
-  - Small groups in a large batch (tile waste is worst)
+The pass auto-selects the kernel via KernelDispatcher:
+  - TRITON_BUCKETED on CUDA (one Triton launch per power-of-2 bucket)
+  - PACKED_SPARSE    on CPU
+  - UNIVARIATE       when all groups are size 1 (no Q/K projected)
 
 Run::
 
@@ -13,21 +14,19 @@ Run::
 
 from __future__ import annotations
 
+import copy
 import statistics
 import time
 from dataclasses import dataclass
 
 import torch
 
+from chop.ir import MaseGraph
 from chop.models.chronos2.configuration_chronos2 import Chronos2CoreConfig
-from chop.models.chronos2.layers import GroupSelfAttention
-from chop.models.chronos2.optimized_layers import (
-    GroupAwareMHA,
-    GroupPartition,
-    KernelVariant,
-    UnivariateGroupAwareMHA,
-)
+from chop.models.chronos2.layers import GroupSelfAttention, TimeSelfAttention
+from chop.models.chronos2.modeling_chronos2 import Chronos2Model
 from chop.models.chronos2.triton_grouped_attn import is_triton_available
+from chop.passes.graph.transforms.timeseries import fast_group_attention_transform_pass
 
 # ---------------------------------------------------------------------------
 # Config
@@ -41,11 +40,25 @@ CFG = Chronos2CoreConfig(
     d_model=512,
     d_kv=64,
     d_ff=2048,
-    num_layers=6,
+    num_layers=1,
     num_heads=8,
     dropout_rate=0.0,
-    attn_implementation="eager",
+    attn_implementation="sdpa",
+    chronos_config={
+        "context_length": 512,
+        "input_patch_size": 16,
+        "input_patch_stride": 16,
+        "output_patch_size": 16,
+        "quantiles": [0.5],
+        "use_reg_token": False,
+        "use_arcsinh": False,
+    },
 )
+
+_CUSTOM_OPS = {
+    "modules": {GroupSelfAttention: {}, TimeSelfAttention: {}},
+    "functions": {},
+}
 
 
 # ---------------------------------------------------------------------------
@@ -87,30 +100,19 @@ def _make_mask(group_ids: torch.Tensor, T: int, dtype: torch.dtype) -> torch.Ten
     return ((1.0 - gtm) * torch.finfo(dtype).min).to(dtype)
 
 
-def _make_univariate_gsa(baseline: GroupSelfAttention) -> GroupSelfAttention:
-    """Return GroupSelfAttention with inner MHA swapped for UnivariateGroupAwareMHA."""
-    opt = GroupSelfAttention(CFG).to(DEVICE).eval()
-    opt.load_state_dict(baseline.state_dict())
-    mha_sd = baseline.self_attention.state_dict()
-    univ = UnivariateGroupAwareMHA(CFG).to(DEVICE)
-    univ.load_state_dict({k: v for k, v in mha_sd.items() if k in ("v.weight", "o.weight")})
-    opt.self_attention = univ
-    return opt
+def _apply_pass(group_ids: torch.Tensor) -> GroupSelfAttention:
+    """Apply fast_group_attention_transform_pass via MaseGraph.
 
-
-def _make_optimized_gsa(
-    baseline: GroupSelfAttention,
-    group_ids: torch.Tensor,
-    variant: KernelVariant,
-) -> GroupSelfAttention:
-    """Return GroupSelfAttention with inner MHA swapped for GroupAwareMHA."""
-    partition = GroupPartition.from_group_ids(group_ids)
-    opt = GroupSelfAttention(CFG).to(DEVICE).eval()
-    opt.load_state_dict(baseline.state_dict())
-    mha = GroupAwareMHA(CFG, partition, variant=variant).to(DEVICE)
-    mha.load_state_dict(baseline.self_attention.state_dict())
-    opt.self_attention = mha
-    return opt
+    Returns the replaced GroupSelfAttention extracted from the traced model,
+    ready to benchmark with (hs, mask) inputs.
+    """
+    model = Chronos2Model(CFG).to(DEVICE).eval()
+    mg = MaseGraph(copy.deepcopy(model), hf_input_names=["context", "group_ids"], custom_ops=_CUSTOM_OPS)
+    mg, _ = fast_group_attention_transform_pass(mg, pass_args={"group_ids": group_ids.cpu()})
+    for m in mg.model.modules():
+        if isinstance(m, GroupSelfAttention):
+            return m.to(DEVICE).eval()
+    raise RuntimeError("No GroupSelfAttention found after pass")
 
 
 # ---------------------------------------------------------------------------
@@ -127,27 +129,19 @@ class BenchCase:
 def build_cases() -> list[BenchCase]:
     cases: list[BenchCase] = []
 
-    # ── Uniform batches (1 bucket occupied — baseline for overhead check) ──
+    # ── Uniform batches ──
     for B, g in [(128, 2), (256, 2), (128, 4), (256, 4), (128, 8), (256, 8)]:
         gids = torch.arange(B, dtype=torch.long) // g
-        cases.append(BenchCase(
-            f"uniform g={g} B={B}", f"{B//g} groups of {g}", 64, gids,
-        ))
+        cases.append(BenchCase(f"uniform g={g} B={B}", f"{B//g} groups of {g}", 64, gids))
 
-    # ── Mixed batches (multiple buckets — where bucketed should win) ──
-    # 2-bucket mix: pairs + quads
+    # ── Mixed batches (multiple buckets) ──
     for B_pairs, B_quads in [(64, 64), (128, 128)]:
         gids = torch.cat([
             torch.arange(B_pairs, dtype=torch.long) // 2,
             torch.arange(B_pairs // 2, B_pairs // 2 + B_quads // 4, dtype=torch.long).repeat_interleave(4),
         ])
-        cases.append(BenchCase(
-            f"mix2+4 B={len(gids)}",
-            f"{B_pairs//2}×2 + {B_quads//4}×4",
-            64, gids,
-        ))
+        cases.append(BenchCase(f"mix2+4 B={len(gids)}", f"{B_pairs//2}×2 + {B_quads//4}×4", 64, gids))
 
-    # 3-bucket mix: pairs + quads + octets
     for scale in [1, 2]:
         gids = torch.tensor(
             [i for i in range(20 * scale) for _ in range(2)]
@@ -155,30 +149,26 @@ def build_cases() -> list[BenchCase]:
             + [i for i in range(30 * scale, 34 * scale) for _ in range(8)],
             dtype=torch.long,
         )
-        B = len(gids)
         cases.append(BenchCase(
-            f"mix2+4+8 B={B}",
-            f"{20*scale}×2 + {10*scale}×4 + {4*scale}×8",
-            64, gids,
+            f"mix2+4+8 B={len(gids)}", f"{20*scale}×2 + {10*scale}×4 + {4*scale}×8", 64, gids,
         ))
 
-    # Realistic Chronos2: lots of small groups, few large
+    # ── Realistic Chronos2 ──
     for scale in [1, 2]:
         gids = torch.tensor(
-            list(range(50 * scale))                                    # 50s univariate
-            + [i for i in range(50 * scale, 100 * scale) for _ in range(2)]   # 50s pairs
-            + [i for i in range(100 * scale, 115 * scale) for _ in range(4)]  # 15s quads
-            + [i for i in range(115 * scale, 117 * scale) for _ in range(8)], # 2s octets
+            list(range(50 * scale))
+            + [i for i in range(50 * scale, 100 * scale) for _ in range(2)]
+            + [i for i in range(100 * scale, 115 * scale) for _ in range(4)]
+            + [i for i in range(115 * scale, 117 * scale) for _ in range(8)],
             dtype=torch.long,
         )
-        B = len(gids)
         cases.append(BenchCase(
-            f"realistic B={B}",
+            f"realistic B={len(gids)}",
             f"{50*scale}×1 + {50*scale}×2 + {15*scale}×4 + {2*scale}×8",
             64, gids,
         ))
 
-    # T sweep on a 3-bucket mix
+    # ── T sweep ──
     for T in [16, 32, 64, 128]:
         gids = torch.tensor(
             [i for i in range(20) for _ in range(2)]
@@ -209,21 +199,16 @@ def main():
     baseline_mod = GroupSelfAttention(CFG).to(DEVICE).eval()
     cases = build_cases()
 
-    # ── Table layout ────────────────────────────────────────────────────────
     sep = "─"
-    W_case = 22
-    W_desc = 30
-    W_ms   = 11
-    W_sp   = 10
+    W_case, W_desc, W_ms, W_var, W_sp = 22, 30, 11, 16, 10
 
     headers = [
         f"{'Case':<{W_case}}",
         f"{'Description':<{W_desc}}",
         f"{'Baseline':>{W_ms}}",
-        f"{'Triton':>{W_ms}}",
-        f"{'Bucketed':>{W_ms}}",
-        f"{'vs Triton':>{W_sp}}",
-        f"{'vs Baseline':>{W_sp}}",
+        f"{'Optimized':>{W_ms}}",
+        f"{'Variant':>{W_var}}",
+        f"{'Speedup':>{W_sp}}",
     ]
     hdr = "  ".join(headers)
     width = len(hdr)
@@ -239,50 +224,40 @@ def main():
         hs   = torch.randn(B, case.T, CFG.d_model, device=DEVICE, dtype=DTYPE)
         mask = _make_mask(group_ids, case.T, DTYPE)
 
-        triton_mod  = _make_optimized_gsa(baseline_mod, group_ids, KernelVariant.TRITON)
-        bucketed    = _make_optimized_gsa(baseline_mod, group_ids, KernelVariant.TRITON_BUCKETED)
+        optimized = _apply_pass(group_ids)
+        variant_name = type(optimized.self_attention).__name__
 
-        base_ms     = _bench(baseline_mod, (hs, mask))
-        triton_ms   = _bench(triton_mod,   (hs, mask))
-        bucketed_ms = _bench(bucketed,     (hs, mask))
+        base_ms = _bench(baseline_mod, (hs, mask))
+        opt_ms  = _bench(optimized,    (hs, mask))
 
-        row = [
+        print("  ".join([
             f"{case.name:<{W_case}}",
             f"{case.description:<{W_desc}}",
             f"{base_ms:>{W_ms}.3f}",
-            f"{triton_ms:>{W_ms}.3f}",
-            f"{bucketed_ms:>{W_ms}.3f}",
-            f"{triton_ms / bucketed_ms:>{W_sp-1}.2f}x",
-            f"{base_ms   / bucketed_ms:>{W_sp-1}.2f}x",
-        ]
-        print("  ".join(row))
+            f"{opt_ms:>{W_ms}.3f}",
+            f"{variant_name:>{W_var}}",
+            f"{base_ms / opt_ms:>{W_sp-1}.2f}x",
+        ]))
 
     print(sep * width)
     print()
     print("All times in milliseconds (median over", ITERS, "iterations).")
-    print("vs Triton    = triton_ms   / bucketed_ms  (>1 means bucketed is faster)")
-    print("vs Baseline  = baseline_ms / bucketed_ms  (>1 means bucketed is faster)")
+    print("Speedup = baseline_ms / optimized_ms  (>1 means optimized is faster)")
     print()
 
     # ── Univariate section ──────────────────────────────────────────────────
-    print("── Univariate (all groups size 1): Baseline vs Triton vs Bucketed vs Univariate ──")
+    print("── Univariate (all groups size 1) ──")
     print()
 
-    W_ucase = 18
-    W_ums   = 11
-    W_usp   = 13
+    W_ucase, W_ums, W_usp = 18, 11, 13
 
     u_headers = [
         f"{'Case':<{W_ucase}}",
         f"{'Baseline':>{W_ums}}",
-        f"{'Triton':>{W_ums}}",
-        f"{'Bucketed':>{W_ums}}",
         f"{'Univariate':>{W_ums}}",
-        f"{'vs Triton':>{W_usp}}",
-        f"{'vs Bucketed':>{W_usp}}",
-        f"{'vs Baseline':>{W_usp}}",
+        f"{'Speedup':>{W_usp}}",
     ]
-    u_hdr   = "  ".join(u_headers)
+    u_hdr = "  ".join(u_headers)
     u_width = len(u_hdr)
 
     print(sep * u_width)
@@ -294,33 +269,21 @@ def main():
         hs   = torch.randn(B, 64, CFG.d_model, device=DEVICE, dtype=DTYPE)
         mask = _make_mask(group_ids, 64, DTYPE)
 
-        triton_mod   = _make_optimized_gsa(baseline_mod, group_ids, KernelVariant.TRITON)
-        bucketed_mod = _make_optimized_gsa(baseline_mod, group_ids, KernelVariant.TRITON_BUCKETED)
-        univ_mod     = _make_univariate_gsa(baseline_mod)
+        univ_mod = _apply_pass(group_ids)
 
-        base_ms  = _bench(baseline_mod, (hs, mask))
-        tri_ms   = _bench(triton_mod,   (hs, mask))
-        buck_ms  = _bench(bucketed_mod, (hs, mask))
-        univ_ms  = _bench(univ_mod,     (hs, mask))
+        base_ms = _bench(baseline_mod, (hs, mask))
+        univ_ms = _bench(univ_mod,     (hs, mask))
 
-        row = [
+        print("  ".join([
             f"{'univ B='+str(B):<{W_ucase}}",
             f"{base_ms:>{W_ums}.3f}",
-            f"{tri_ms:>{W_ums}.3f}",
-            f"{buck_ms:>{W_ums}.3f}",
             f"{univ_ms:>{W_ums}.3f}",
-            f"{tri_ms  / univ_ms:>{W_usp-1}.2f}x",
-            f"{buck_ms / univ_ms:>{W_usp-1}.2f}x",
             f"{base_ms / univ_ms:>{W_usp-1}.2f}x",
-        ]
-        print("  ".join(row))
+        ]))
 
     print(sep * u_width)
     print()
-    print("Univariate = UnivariateGroupAwareMHA (pass-time decision, no Q/K allocated)")
-    print("vs Triton    = triton_ms   / univ_ms  (>1 means univariate is faster)")
-    print("vs Bucketed  = bucketed_ms / univ_ms  (>1 means univariate is faster)")
-    print("vs Baseline  = baseline_ms / univ_ms  (>1 means univariate is faster)")
+    print("Univariate = UnivariateGroupAwareMHA (no Q/K projected, decided at pass time)")
     print()
 
 
