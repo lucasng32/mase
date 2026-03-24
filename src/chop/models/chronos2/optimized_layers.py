@@ -107,7 +107,7 @@ class KernelDispatcher:
     3. **Packed sparse** — pure PyTorch fallback for CPU.
     """
 
-    TRITON_CROSSOVER = 8  # retained for reference; not used in auto-selection
+    # TRITON_CROSSOVER = 8  # retained for reference; not used in auto-selection
 
     @staticmethod
     def select(

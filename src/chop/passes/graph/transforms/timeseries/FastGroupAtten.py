@@ -66,15 +66,6 @@ class GroupAttentionAnalyser:
             module = mg.model.get_submodule(node.target)
             if not isinstance(module, GroupSelfAttention):
                 continue
-            # if isinstance(module.self_attention, (GroupAwareMHA, UnivariateGroupAwareMHA)):
-            #     results.append(
-            #         GroupAttentionInfo(
-            #             node_name=node.name,
-            #             module_path=node.target,
-            #             can_optimise=False,
-            #             reason="Inner MHA already replaced with GroupAwareMHA or UnivariateGroupAwareMHA",
-            #         )
-            #     )
             else:
                 results.append(
                     GroupAttentionInfo(
@@ -110,13 +101,6 @@ def fast_group_attention_transform_pass(
         return
 
     partition = GroupPartition.from_group_ids(group_ids)
-
-    # unnecessary feature
-    # forced_variant_name: str | None = pass_args.get("kernel_variant")
-    # forced_variant: KernelVariant | None = None
-    # if forced_variant_name is not None:
-    #     forced_variant = KernelVariant[forced_variant_name.upper()]
-
     analysis = GroupAttentionAnalyser.analyse(mg)
 
     replaced = 0

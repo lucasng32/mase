@@ -175,8 +175,6 @@ def triton_bucketed_attention(
     Returns:
         Output tensor of the same shape as ``Q``.
     """
-    assert is_triton_available(), "Triton is not available"
-
     import triton
 
     from .triton_grouped_attn import _tiled_grouped_attn_fwd
