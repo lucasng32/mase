@@ -59,11 +59,6 @@ class GroupAttentionAnalyser:
 
     @staticmethod
     def analyse(mg) -> list[GroupAttentionInfo]:
-        """Return analysis info for every ``call_module`` node.
-
-        Eligible nodes are ``GroupSelfAttention`` instances whose inner MHA
-        has not yet been replaced with ``GroupAwareMHA``.
-        """
         results: list[GroupAttentionInfo] = []
         for node in mg.fx_graph.nodes:
             if node.op != "call_module":
@@ -71,15 +66,15 @@ class GroupAttentionAnalyser:
             module = mg.model.get_submodule(node.target)
             if not isinstance(module, GroupSelfAttention):
                 continue
-            if isinstance(module.self_attention, (GroupAwareMHA, UnivariateGroupAwareMHA)):
-                results.append(
-                    GroupAttentionInfo(
-                        node_name=node.name,
-                        module_path=node.target,
-                        can_optimise=False,
-                        reason="Inner MHA already replaced with GroupAwareMHA or UnivariateGroupAwareMHA",
-                    )
-                )
+            # if isinstance(module.self_attention, (GroupAwareMHA, UnivariateGroupAwareMHA)):
+            #     results.append(
+            #         GroupAttentionInfo(
+            #             node_name=node.name,
+            #             module_path=node.target,
+            #             can_optimise=False,
+            #             reason="Inner MHA already replaced with GroupAwareMHA or UnivariateGroupAwareMHA",
+            #         )
+            #     )
             else:
                 results.append(
                     GroupAttentionInfo(
@@ -99,58 +94,40 @@ def fast_group_attention_transform_pass(
     mg,
     pass_args: dict | None = None,
 ) -> tuple:
-    """Replace the inner MHA of every ``GroupSelfAttention`` in *mg* with
-    ``GroupAwareMHA``.
-
-    The outer ``GroupSelfAttention`` (layer norm, residual, dropout) is
-    unchanged; only ``module.self_attention`` is swapped.
-
-    Args:
-        mg: ``MaseGraph`` wrapping a Chronos2Model.
-        pass_args:
-            group_ids (torch.Tensor, required):
-                1-D long tensor of shape ``(B,)`` matching the batch size that
-                will be used at inference.
-            kernel_variant (str, optional):
-                Force a specific kernel: ``"univariate"``, ``"triton"``, or
-                ``"packed_sparse"``. Defaults to auto-selection via
-                ``KernelDispatcher``.
-
-    Returns:
-        ``(mg, info_dict)`` where *info_dict* contains ``replaced`` count,
-        the ``partition``, and per-node ``analysis``.
-    """
     if pass_args is None:
-        pass_args = {}
+        # for this case if the user does not provide an args,
+        # then we assume that the user does not have a fixed group ids for the pipeline 
+        # and therefore the optimization should not be done 
+        return
 
-    group_ids: torch.Tensor | None = pass_args.get("group_ids")
+    group_ids: torch.Tensor | None = pass_args.get("group_ids", None)
     if group_ids is None:
-        raise ValueError(
-            "fast_group_attention_transform_pass requires 'group_ids' in "
-            "pass_args.  Example: pass_args={'group_ids': torch.arange(64)}"
-        )
+        # same reason as the above, when user does not provide group ids we assume 
+        # that the user does not have a static group ids and therefore the optimization does not apply
+        # optimization can only be done when the group ids are known ahead of time? 
+        # actually that is not true, it can technically be done but idk how to do it at runtime with mase 
+        # we can technically do it by passing the group ids down there but at that point why bother with a pass, just hardcode the kernel lol
+        return
 
     partition = GroupPartition.from_group_ids(group_ids)
 
-    forced_variant_name: str | None = pass_args.get("kernel_variant")
-    forced_variant: KernelVariant | None = None
-    if forced_variant_name is not None:
-        forced_variant = KernelVariant[forced_variant_name.upper()]
+    # unnecessary feature
+    # forced_variant_name: str | None = pass_args.get("kernel_variant")
+    # forced_variant: KernelVariant | None = None
+    # if forced_variant_name is not None:
+    #     forced_variant = KernelVariant[forced_variant_name.upper()]
 
     analysis = GroupAttentionAnalyser.analyse(mg)
 
     replaced = 0
     for info in analysis:
         if not info.can_optimise:
-            logger.debug("Skipping %s: %s", info.node_name, info.reason)
             continue
 
         module: GroupSelfAttention = mg.model.get_submodule(info.module_path)
         device = next(module.parameters()).device
 
         if partition.all_univariate:
-            # All groups are size 1: attention output is always V.
-            # The pass handles this at compile time — no kernel dispatch needed.
             logger.info(
                 "Replacing self_attention in %s with UnivariateGroupAwareMHA",
                 info.module_path,
@@ -162,7 +139,7 @@ def fast_group_attention_transform_pass(
             )
             variant_name = "UNIVARIATE"
         else:
-            variant = forced_variant or KernelDispatcher.select(partition, device)
+            variant = KernelDispatcher.select(partition, device)
             logger.info(
                 "Replacing self_attention in %s with GroupAwareMHA (variant=%s)",
                 info.module_path,
