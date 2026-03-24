@@ -3,6 +3,7 @@ aienginev2/
 llvm/
 mlir-aie/
 vagrant/.vagrant/
+*.deb
 # init file
 *.mem
 # Project

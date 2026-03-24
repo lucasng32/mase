@@ -132,15 +132,11 @@ def fused_rope_time_attention_transform_pass(
 
         - ``replaced``  (int): number of modules swapped.
         - ``analysis``  (list[RoPETimeAttnInfo]): per-node analysis results.
-        - ``triton_active`` (bool): whether the Triton path will be used at
-          runtime (depends on device and Triton availability).
     """
     if pass_args is None:
         pass_args = {}
 
     analysis = RoPETimeAttnAnalyser.analyse(mg)
-
-    triton_active: bool | None = None
     replaced = 0
 
     for info in analysis:
@@ -163,28 +159,19 @@ def fused_rope_time_attention_transform_pass(
         # Swap the inner MHA — outer TimeSelfAttention is untouched
         module.self_attention = fused_mha
 
-        if triton_active is None:
-            triton_active = fused_mha._use_triton and device.type == "cuda"
-
-        logger.info(
-            "Replaced self_attention in %s with RoPEFusedMHA (triton=%s)",
-            info.module_path,
-            fused_mha._use_triton,
-        )
+        logger.info("Replaced self_attention in %s with RoPEFusedMHA", info.module_path)
 
         # Write metadata for downstream passes
         node = _find_node_by_target(mg, info.module_path)
         if node is not None and "mase" in node.meta:
             ts_meta = node.meta["mase"].parameters.setdefault("timeseries", {})
             ts_meta["rope_fused"] = True
-            ts_meta["triton_active"] = fused_mha._use_triton
 
         replaced += 1
 
     return mg, {
         "replaced": replaced,
         "analysis": analysis,
-        "triton_active": bool(triton_active) if triton_active is not None else False,
     }
 
 
