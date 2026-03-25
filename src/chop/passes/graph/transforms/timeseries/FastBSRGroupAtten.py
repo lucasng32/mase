@@ -11,7 +11,7 @@ from dataclasses import dataclass
 import torch
 
 from chop.models.chronos2.layers import GroupSelfAttention
-from chop.models.chronos2.optimized_layers import SparseGroupMHA
+from chop.models.chronos2.sparse_group_mha import SparseGroupMHA
 
 logger = logging.getLogger(__name__)
 

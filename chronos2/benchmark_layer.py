@@ -6,7 +6,7 @@ import os
 
 from chop.models.chronos2.configuration_chronos2 import Chronos2CoreConfig
 from chop.models.chronos2.layers import GroupSelfAttention
-from chop.models.chronos2.optimized_layers import SparseGroupMHA
+from chop.models.chronos2.sparse_group_mha import SparseGroupMHA
 
 def benchmark_module(module, kwargs, warmup=20, runs=100):
     for _ in range(warmup):
