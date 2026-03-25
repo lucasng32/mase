@@ -43,6 +43,8 @@ from .configuration_chronos2 import Chronos2CoreConfig
 from .layers import AttentionOutput
 from .triton_grouped_attn import is_triton_available, triton_grouped_attention
 from .triton_rope_attn import triton_fused_rope_attention
+from .triton_bucketed_attn import BucketedPartition, triton_bucketed_attention
+from .triton_stitched_attn import StitchedPartition, triton_stitched_attention
 
 logger = logging.getLogger(__name__)
 
@@ -84,26 +86,13 @@ def compute_groups(group_ids: torch.Tensor) -> list[torch.Tensor]:
 # Kernel variant selection
 # ═══════════════════════════════════════════════════════════════════════════════
 class KernelVariant(Enum):
-    UNIVARIATE = auto()
+    TRITON_STITCHED = auto()   # stitched tiles for small groups + bucketed for large
+    TRITON_BUCKETED = auto()   # original: one bucket per power-of-2 size (no stitching)
     TRITON = auto()
     PACKED_SPARSE = auto()
 
 
 class KernelDispatcher:
-    """Choose the best kernel variant for a given partition and device.
-
-    Default auto-selection order (all paths remain available via explicit
-    ``variant=`` argument):
-
-    1. **Univariate** — all groups size 1: skip Q/K entirely.
-    2. **Triton** — JIT-compiled tiled kernel.  Used on CUDA when Triton is
-       available and groups are large enough to benefit from tile parallelism
-       (``max_group_size > TRITON_CROSSOVER``).
-    3. **Packed sparse** — pure PyTorch fallback for CPU or small groups.
-    """
-
-    TRITON_CROSSOVER = 8  # min group size at which Triton beats packed-sparse
-
     @staticmethod
     def select(
         partition: GroupPartition,
@@ -115,15 +104,42 @@ class KernelDispatcher:
             partition: pre-computed group partition.
             device: target device.
         """
-        if partition.all_univariate:
-            return KernelVariant.UNIVARIATE
-        if (
-            device.type == "cuda"
-            and is_triton_available()
-            and partition.max_group_size > KernelDispatcher.TRITON_CROSSOVER
-        ):
-            return KernelVariant.TRITON
+        if device.type == "cuda" and is_triton_available():
+            return KernelVariant.TRITON_STITCHED
         return KernelVariant.PACKED_SPARSE
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# UnivariateGroupAwareMHA
+# ═══════════════════════════════════════════════════════════════════════════════
+class UnivariateGroupAwareMHA(nn.Module):
+    """Replaces ``MHA`` when the MASE pass determines all groups are size 1.
+
+    For a group of size 1, ``softmax([q·k]) = 1``, so the attention output is
+    always ``V``.  Q and K projections are never computed.
+
+    Only ``v`` and ``o`` weights are kept; ``q`` and ``k`` are discarded.
+    This is instantiated by the pass, never by ``KernelDispatcher``.
+    """
+
+    def __init__(self, config: Chronos2CoreConfig):
+        super().__init__()
+        inner_dim = config.num_heads * config.d_kv
+        self.v = nn.Linear(config.d_model, inner_dim, bias=False)
+        self.o = nn.Linear(inner_dim, config.d_model, bias=False)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        mask: torch.Tensor,
+        encoder_states: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        output_attentions: bool = False,
+    ) -> AttentionOutput:
+        return AttentionOutput(
+            hidden_states=self.o(self.v(hidden_states)),
+            attn_weights=None,
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -165,8 +181,10 @@ class GroupAwareMHA(nn.Module):
         self._partition = partition
         self._variant = variant or KernelVariant.PACKED_SPARSE
 
-        if partition.all_univariate:
-            self._variant = KernelVariant.UNIVARIATE
+        if self._variant == KernelVariant.TRITON_STITCHED:
+            self._precompute_stitched_triton_buffers(partition)
+        elif self._variant == KernelVariant.TRITON_BUCKETED:
+            self._precompute_bucketed_triton_buffers(partition)
         elif self._variant == KernelVariant.TRITON:
             self._precompute_triton_buffers(partition)
         else:
@@ -197,6 +215,44 @@ class GroupAwareMHA(nn.Module):
             len(self._sort_perm), device=self._sort_perm.device
         )
         self.register_buffer("_unsort_perm", inv, persistent=False)
+
+    @staticmethod
+    def _group_ids_from_partition(partition: GroupPartition) -> torch.Tensor:
+        """Reconstruct a flat group_ids tensor from a GroupPartition."""
+        B = sum(g.numel() for g in partition.groups)
+        group_ids = torch.empty(B, dtype=torch.long)
+        for label, members in enumerate(partition.groups):
+            group_ids[members] = label
+        return group_ids
+
+    def _precompute_bucketed_triton_buffers(self, partition: GroupPartition) -> None:
+        """Build the BucketedPartition and register sort/unsort permutations.
+
+        Registered as non-persistent so they don't appear in state_dict().
+        The BucketedPartition itself is a plain attribute (not a buffer) since
+        it contains non-tensor metadata.
+        """
+        group_ids = self._group_ids_from_partition(partition)
+        bp = BucketedPartition.from_group_ids(group_ids)
+        self._bucketed_partition = bp
+        self.register_buffer(
+            "_bucketed_sort_perm", bp.global_sort_perm, persistent=False
+        )
+        self.register_buffer(
+            "_bucketed_unsort_perm", bp.global_unsort_perm, persistent=False
+        )
+
+    def _precompute_stitched_triton_buffers(self, partition: GroupPartition) -> None:
+        """Build the StitchedPartition and register sort/unsort permutations."""
+        group_ids = self._group_ids_from_partition(partition)
+        sp = StitchedPartition.from_group_ids(group_ids)
+        self._stitched_partition = sp
+        self.register_buffer(
+            "_stitched_sort_perm", sp.global_sort_perm, persistent=False
+        )
+        self.register_buffer(
+            "_stitched_unsort_perm", sp.global_unsort_perm, persistent=False
+        )
 
     def _precompute_packed_buffers(self, partition: GroupPartition) -> None:
         """Build padded gather/scatter indices for the packed-sparse path.
@@ -252,8 +308,10 @@ class GroupAwareMHA(nn.Module):
             mask: group-time additive mask from the model; not used at runtime
                 by the optimised paths (group structure is baked into buffers).
         """
-        if self._variant == KernelVariant.UNIVARIATE:
-            attn_out = self._forward_univariate(hidden_states)
+        if self._variant == KernelVariant.TRITON_STITCHED:
+            attn_out = self._forward_stitched_triton(hidden_states)
+        elif self._variant == KernelVariant.TRITON_BUCKETED:
+            attn_out = self._forward_bucketed_triton(hidden_states)
         elif self._variant == KernelVariant.TRITON:
             attn_out = self._forward_triton(hidden_states)
         else:
@@ -264,10 +322,6 @@ class GroupAwareMHA(nn.Module):
     # ------------------------------------------------------------------
     # Dispatch paths
     # ------------------------------------------------------------------
-    def _forward_univariate(self, x: torch.Tensor) -> torch.Tensor:
-        """All groups size 1 → softmax([single logit]) = 1, so out = V."""
-        return self.o(self.v(x))
-
     def _forward_triton(self, x: torch.Tensor) -> torch.Tensor:
         """Fused Triton kernel — no padding, no Python loops."""
         T, B, d = x.shape
@@ -298,6 +352,58 @@ class GroupAwareMHA(nn.Module):
         out = out[:, self._unsort_perm, :]
 
         return self.o(out)
+
+    def _forward_stitched_triton(self, x: torch.Tensor) -> torch.Tensor:
+        """Stitched-tile Triton dispatch — small groups bin-packed, large groups bucketed."""
+        T, B, d = x.shape
+        H, D = self.n_heads, self.kv_proj_dim
+
+        q = self.q(x).view(T, B, H, D)
+        k = self.k(x).view(T, B, H, D)
+        v = self.v(x).view(T, B, H, D)
+
+        q_s = q[:, self._stitched_sort_perm, :, :].permute(0, 2, 1, 3).contiguous()
+        k_s = k[:, self._stitched_sort_perm, :, :].permute(0, 2, 1, 3).contiguous()
+        v_s = v[:, self._stitched_sort_perm, :, :].permute(0, 2, 1, 3).contiguous()
+
+        # Lazy device migration (once)
+        sp = self._stitched_partition
+        for bucket in sp.buckets.values():
+            bucket.cu_seqlens = bucket.cu_seqlens.to(x.device)
+        if sp.stitched is not None:
+            st = sp.stitched
+            st.tile_seq_starts = st.tile_seq_starts.to(x.device)
+            st.tile_seq_counts = st.tile_seq_counts.to(x.device)
+            st.tile_group_labels = st.tile_group_labels.to(x.device)
+
+        out = triton_stitched_attention(q_s, k_s, v_s, sp, scale=1.0)
+
+        out = out.permute(0, 2, 1, 3).reshape(T, B, -1)
+        return self.o(out[:, self._stitched_unsort_perm, :])
+
+    def _forward_bucketed_triton(self, x: torch.Tensor) -> torch.Tensor:
+        """Per-bucket Triton dispatch — one kernel launch per occupied bucket."""
+        T, B, d = x.shape
+        H, D = self.n_heads, self.kv_proj_dim
+
+        q = self.q(x).view(T, B, H, D)
+        k = self.k(x).view(T, B, H, D)
+        v = self.v(x).view(T, B, H, D)
+
+        # Sort batch into bucket order
+        q_s = q[:, self._bucketed_sort_perm, :, :].permute(0, 2, 1, 3).contiguous()
+        k_s = k[:, self._bucketed_sort_perm, :, :].permute(0, 2, 1, 3).contiguous()
+        v_s = v[:, self._bucketed_sort_perm, :, :].permute(0, 2, 1, 3).contiguous()
+
+        # Move metadata tensors to the right device (done lazily once)
+        bp = self._bucketed_partition
+        for bucket in bp.buckets.values():
+            bucket.cu_seqlens = bucket.cu_seqlens.to(x.device)
+
+        out = triton_bucketed_attention(q_s, k_s, v_s, bp, scale=1.0)
+
+        out = out.permute(0, 2, 1, 3).reshape(T, B, -1)
+        return self.o(out[:, self._bucketed_unsort_perm, :])
 
     def _forward_packed_sparse(self, x: torch.Tensor) -> torch.Tensor:
         """Gather → pad → group attention → scatter. Works on any device."""

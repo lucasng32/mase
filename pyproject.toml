@@ -84,6 +84,7 @@ dependencies = [
     "torchaudio>=2.6.0",
     "fev>=0.7.0",
     "chronos-forecasting>=2.2.2",
+    "flashinfer-python>=0.2.5",
 ]
 
 [build-system]
@@ -92,6 +93,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[[tool.uv.index]]
+url = "https://flashinfer.ai/whl/cu126/torch2.6/"
 
 [[tool.uv.index]]
 name = "pytorch-cu126"
