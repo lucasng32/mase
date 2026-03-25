@@ -26,8 +26,11 @@ Two-phase implementation:
 2. ``_fused_rope_attn_fwd`` — autotuned FlashAttention-style attention
    loop.  ``@triton.autotune`` sweeps BLOCK_M ∈ {32,64,128},
    BLOCK_N ∈ {64,128}, num_warps ∈ {4,8}, num_stages ∈ {1,2}.
-   The first call for a given (S, HALF_D) shape benchmarks 6 configs;
-   subsequent calls use the cached best.
+   The first call for a given (B, H, S, HALF_D) shape benchmarks 6 configs;
+   subsequent calls use the cached best.  B and H are included in the key
+   so that large-batch shapes (where bigger BLOCK_M amortises per-CTA setup
+   cost) get a different cached config from small-batch shapes (where smaller
+   BLOCK_M improves SM occupancy).
 
 Common design
 -------------
@@ -298,7 +301,7 @@ if _TRITON_AVAILABLE:
             triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=8, num_stages=2),
             triton.Config({"BLOCK_M": 32,  "BLOCK_N": 32},  num_warps=4, num_stages=1),
         ],
-        key=["S", "HALF_D"],
+        key=["B", "H", "S", "HALF_D"],
     )
     @triton.jit
     def _fused_rope_attn_fwd(
@@ -319,7 +322,7 @@ if _TRITON_AVAILABLE:
         # Mask strides: (B, 1, S, S) — skip the head-1 stride
         stride_mb, stride_mq, stride_mk,
         # Dimensions
-        H, S, D,
+        B, H, S, D,
         HALF_D:   tl.constexpr,
         BLOCK_M:  tl.constexpr,    # autotuned
         BLOCK_N:  tl.constexpr,    # autotuned
@@ -522,7 +525,7 @@ def triton_fused_rope_attention(
             V.stride(0),     V.stride(1),     V.stride(2),     V.stride(3),
             Out.stride(0),   Out.stride(1),   Out.stride(2),   Out.stride(3),
             mask.stride(0),  mask.stride(2),  mask.stride(3),
-            H=H, S=S, D=D,
+            B=B, H=H, S=S, D=D,
             HALF_D=HALF_D,
             BLOCK_HD=BLOCK_HD,
             BLOCK_D=BLOCK_D,
