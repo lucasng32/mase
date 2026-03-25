@@ -43,6 +43,7 @@ from .configuration_chronos2 import Chronos2CoreConfig
 from .layers import AttentionOutput
 from .triton_grouped_attn import is_triton_available, triton_grouped_attention
 from .triton_bucketed_attn import BucketedPartition, triton_bucketed_attention
+from .triton_stitched_attn import StitchedPartition, triton_stitched_attention
 
 logger = logging.getLogger(__name__)
 
@@ -84,31 +85,13 @@ def compute_groups(group_ids: torch.Tensor) -> list[torch.Tensor]:
 # Kernel variant selection
 # ═══════════════════════════════════════════════════════════════════════════════
 class KernelVariant(Enum):
-    TRITON_BUCKETED = auto()
+    TRITON_STITCHED = auto()   # stitched tiles for small groups + bucketed for large
+    TRITON_BUCKETED = auto()   # original: one bucket per power-of-2 size (no stitching)
     TRITON = auto()
     PACKED_SPARSE = auto()
 
 
 class KernelDispatcher:
-    """Choose the best kernel variant for a given partition and device.
-
-    The univariate case (all groups size 1) is handled at the MASE pass level
-    by substituting ``UnivariateGroupAwareMHA`` before inference — it never
-    reaches ``KernelDispatcher``.
-
-    Default auto-selection order (all paths remain available via explicit
-    ``variant=`` argument):
-
-    1. **Triton bucketed** — one Triton kernel launch per occupied group-size
-       bucket, with ``BLOCK_M`` matched to the bucket size.  Selected on CUDA
-       whenever Triton is available.
-    2. **Triton** — single Triton launch with global ``max_group_size`` tile.
-       Kept as an explicit override (``variant="triton"``); not auto-selected.
-    3. **Packed sparse** — pure PyTorch fallback for CPU.
-    """
-
-    # TRITON_CROSSOVER = 8  # retained for reference; not used in auto-selection
-
     @staticmethod
     def select(
         partition: GroupPartition,
@@ -121,14 +104,7 @@ class KernelDispatcher:
             device: target device.
         """
         if device.type == "cuda" and is_triton_available():
-            return KernelVariant.TRITON_BUCKETED
-        # Old single-launch Triton path (now superseded by TRITON_BUCKETED):
-        # if (
-        #     device.type == "cuda"
-        #     and is_triton_available()
-        #     and partition.max_group_size > KernelDispatcher.TRITON_CROSSOVER
-        # ):
-        #     return KernelVariant.TRITON
+            return KernelVariant.TRITON_STITCHED
         return KernelVariant.PACKED_SPARSE
 
 
@@ -204,7 +180,9 @@ class GroupAwareMHA(nn.Module):
         self._partition = partition
         self._variant = variant or KernelVariant.PACKED_SPARSE
 
-        if self._variant == KernelVariant.TRITON_BUCKETED:
+        if self._variant == KernelVariant.TRITON_STITCHED:
+            self._precompute_stitched_triton_buffers(partition)
+        elif self._variant == KernelVariant.TRITON_BUCKETED:
             self._precompute_bucketed_triton_buffers(partition)
         elif self._variant == KernelVariant.TRITON:
             self._precompute_triton_buffers(partition)
@@ -263,6 +241,18 @@ class GroupAwareMHA(nn.Module):
             "_bucketed_unsort_perm", bp.global_unsort_perm, persistent=False
         )
 
+    def _precompute_stitched_triton_buffers(self, partition: GroupPartition) -> None:
+        """Build the StitchedPartition and register sort/unsort permutations."""
+        group_ids = self._group_ids_from_partition(partition)
+        sp = StitchedPartition.from_group_ids(group_ids)
+        self._stitched_partition = sp
+        self.register_buffer(
+            "_stitched_sort_perm", sp.global_sort_perm, persistent=False
+        )
+        self.register_buffer(
+            "_stitched_unsort_perm", sp.global_unsort_perm, persistent=False
+        )
+
     def _precompute_packed_buffers(self, partition: GroupPartition) -> None:
         """Build padded gather/scatter indices for the packed-sparse path.
 
@@ -317,7 +307,9 @@ class GroupAwareMHA(nn.Module):
             mask: group-time additive mask from the model; not used at runtime
                 by the optimised paths (group structure is baked into buffers).
         """
-        if self._variant == KernelVariant.TRITON_BUCKETED:
+        if self._variant == KernelVariant.TRITON_STITCHED:
+            attn_out = self._forward_stitched_triton(hidden_states)
+        elif self._variant == KernelVariant.TRITON_BUCKETED:
             attn_out = self._forward_bucketed_triton(hidden_states)
         elif self._variant == KernelVariant.TRITON:
             attn_out = self._forward_triton(hidden_states)
@@ -360,6 +352,34 @@ class GroupAwareMHA(nn.Module):
 
         return self.o(out)
 
+    def _forward_stitched_triton(self, x: torch.Tensor) -> torch.Tensor:
+        """Stitched-tile Triton dispatch — small groups bin-packed, large groups bucketed."""
+        T, B, d = x.shape
+        H, D = self.n_heads, self.kv_proj_dim
+
+        q = self.q(x).view(T, B, H, D)
+        k = self.k(x).view(T, B, H, D)
+        v = self.v(x).view(T, B, H, D)
+
+        q_s = q[:, self._stitched_sort_perm, :, :].permute(0, 2, 1, 3).contiguous()
+        k_s = k[:, self._stitched_sort_perm, :, :].permute(0, 2, 1, 3).contiguous()
+        v_s = v[:, self._stitched_sort_perm, :, :].permute(0, 2, 1, 3).contiguous()
+
+        # Lazy device migration (once)
+        sp = self._stitched_partition
+        for bucket in sp.buckets.values():
+            bucket.cu_seqlens = bucket.cu_seqlens.to(x.device)
+        if sp.stitched is not None:
+            st = sp.stitched
+            st.tile_seq_starts = st.tile_seq_starts.to(x.device)
+            st.tile_seq_counts = st.tile_seq_counts.to(x.device)
+            st.tile_group_labels = st.tile_group_labels.to(x.device)
+
+        out = triton_stitched_attention(q_s, k_s, v_s, sp, scale=1.0)
+
+        out = out.permute(0, 2, 1, 3).reshape(T, B, -1)
+        return self.o(out[:, self._stitched_unsort_perm, :])
+
     def _forward_bucketed_triton(self, x: torch.Tensor) -> torch.Tensor:
         """Per-bucket Triton dispatch — one kernel launch per occupied bucket."""
         T, B, d = x.shape
@@ -374,7 +394,7 @@ class GroupAwareMHA(nn.Module):
         k_s = k[:, self._bucketed_sort_perm, :, :].permute(0, 2, 1, 3).contiguous()
         v_s = v[:, self._bucketed_sort_perm, :, :].permute(0, 2, 1, 3).contiguous()
 
-        # Move bucket cu_seqlens to the right device (done lazily once)
+        # Move metadata tensors to the right device (done lazily once)
         bp = self._bucketed_partition
         for bucket in bp.buckets.values():
             bucket.cu_seqlens = bucket.cu_seqlens.to(x.device)
