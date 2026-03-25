@@ -25,6 +25,7 @@ from chop.ir import MaseGraph
 from chop.models.chronos2.configuration_chronos2 import Chronos2CoreConfig
 from chop.models.chronos2.layers import GroupSelfAttention, TimeSelfAttention
 from chop.models.chronos2.modeling_chronos2 import Chronos2Model
+from chop.models.chronos2.optimized_layers import GroupAwareMHA, GroupPartition, KernelVariant
 from chop.models.chronos2.triton_grouped_attn import is_triton_available
 from chop.passes.graph.transforms.timeseries import fast_group_attention_transform_pass
 
@@ -100,15 +101,19 @@ def _make_mask(group_ids: torch.Tensor, T: int, dtype: torch.dtype) -> torch.Ten
     return ((1.0 - gtm) * torch.finfo(dtype).min).to(dtype)
 
 
-def _apply_pass(group_ids: torch.Tensor) -> GroupSelfAttention:
+def _apply_pass(group_ids: torch.Tensor, variant: KernelVariant | None = None) -> GroupSelfAttention:
     """Apply fast_group_attention_transform_pass via MaseGraph.
 
     Returns the replaced GroupSelfAttention extracted from the traced model,
     ready to benchmark with (hs, mask) inputs.
+
+    ``variant`` overrides the kernel selected by ``KernelDispatcher``; pass
+    ``None`` to use the default (TRITON_STITCHED on CUDA).
     """
     model = Chronos2Model(CFG).to(DEVICE).eval()
     mg = MaseGraph(copy.deepcopy(model), hf_input_names=["context", "group_ids"], custom_ops=_CUSTOM_OPS)
-    mg, _ = fast_group_attention_transform_pass(mg, pass_args={"group_ids": group_ids.cpu()})
+    pass_args: dict = {"group_ids": group_ids.cpu()}
+    mg, _ = fast_group_attention_transform_pass(mg, pass_args=pass_args)
     for m in mg.model.modules():
         if isinstance(m, GroupSelfAttention):
             return m.to(DEVICE).eval()
