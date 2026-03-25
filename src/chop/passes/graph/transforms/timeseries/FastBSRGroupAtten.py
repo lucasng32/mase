@@ -2,10 +2,9 @@
 MASE transform pass: swap the inner MHA of ``GroupSelfAttention`` with
 ``SparseGroupMHA``.
 
-``group_ids`` must be provided in ``pass_args``. The pass computes the BSR 
-group partition once, writes it into each node's MASE metadata, and replaces 
-``group_self_attn.self_attention`` with a ``SparseGroupMHA`` instance so that
-``forward()`` dynamically expands the metadata without inspecting the mask at runtime.
+``group_ids`` in ``pass_args`` is optional. If provided, it is used as a warm-start
+for sparse metadata. Runtime metadata generation/caching happens inside
+``SparseGroupMHA`` so varying batch composition can be supported without retracing.
 """
 import logging
 from dataclasses import dataclass
@@ -58,8 +57,6 @@ def fast_bsr_group_attention_transform_pass(mg, pass_args: dict | None = None) -
         pass_args = {}
 
     group_ids: torch.Tensor | None = pass_args.get("group_ids")
-    if group_ids is None:
-        raise ValueError("Requires 'group_ids' in pass_args.")
 
     analysis = GroupAttentionAnalyser.analyse(mg)
 
@@ -83,19 +80,10 @@ def fast_bsr_group_attention_transform_pass(mg, pass_args: dict | None = None) -
 
         node = _find_node_by_target(mg, info.module_path)
         if node is not None:
-            # Disconnect the dense mask from the graph so eliminate_dead_code can remove it
-            if len(node.args) > 1:
-                new_args = list(node.args)
-                new_args[1] = None
-                node.args = tuple(new_args)
-            if 'attention_mask' in node.kwargs:
-                new_kwargs = dict(node.kwargs)
-                new_kwargs['attention_mask'] = None
-                node.kwargs = new_kwargs
-                
             if "mase" in node.meta:
                 ts_meta = node.meta["mase"].parameters.setdefault("timeseries", {})
-                ts_meta["group_ids"] = group_ids.cpu()
+                if group_ids is not None:
+                    ts_meta["group_ids"] = group_ids.cpu()
                 ts_meta["bsr_fused"] = True
 
         replaced += 1
