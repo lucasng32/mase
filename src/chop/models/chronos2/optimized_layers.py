@@ -42,6 +42,7 @@ import torch.nn.functional as F
 from .configuration_chronos2 import Chronos2CoreConfig
 from .layers import AttentionOutput
 from .triton_grouped_attn import is_triton_available, triton_grouped_attention
+from .triton_rope_attn import triton_fused_rope_attention
 from .triton_bucketed_attn import BucketedPartition, triton_bucketed_attention
 from .triton_stitched_attn import StitchedPartition, triton_stitched_attention
 
@@ -442,3 +443,88 @@ class GroupAwareMHA(nn.Module):
         attn_out = self.o(attn_out).reshape(T, G * M, d)
 
         return attn_out[:, self._real_flat_idx, :]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RoPEFusedMHA
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class RoPEFusedMHA(nn.Module):
+    """Drop-in replacement for ``MHA`` inside ``TimeSelfAttention``.
+
+    Fuses the RoPE rotation into the Triton attention kernel so that rotated Q
+    and K tensors are never materialised in global memory.
+
+    Weight keys (q/k/v/o) match ``MHA`` exactly so
+    ``load_state_dict(mha.state_dict(), strict=False)`` transfers all
+    learnable parameters.  ``inv_freq`` is a non-persistent buffer and is not
+    in the state dict.
+    """
+
+    def __init__(self, config: Chronos2CoreConfig):
+        super().__init__()
+
+        self.d_model: int = config.d_model
+        self.kv_proj_dim: int = config.d_kv
+        self.n_heads: int = config.num_heads
+        self.dropout: float = config.dropout_rate
+        self.inner_dim: int = self.n_heads * self.kv_proj_dim
+        self.config = config
+
+        self.q = nn.Linear(self.d_model, self.inner_dim, bias=False)
+        self.k = nn.Linear(self.d_model, self.inner_dim, bias=False)
+        self.v = nn.Linear(self.d_model, self.inner_dim, bias=False)
+        self.o = nn.Linear(self.inner_dim, self.d_model, bias=False)
+
+        inv_freq = 1.0 / (
+            config.rope_theta
+            ** (
+                torch.arange(0, self.kv_proj_dim, 2, dtype=torch.int64).float()
+                / self.kv_proj_dim
+            )
+        )
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    # ------------------------------------------------------------------
+    # Forward — identical signature to MHA.forward()
+    # ------------------------------------------------------------------
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        mask: torch.Tensor,
+        encoder_states: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        output_attentions: bool = False,
+    ) -> AttentionOutput:
+        """Fused RoPE + time-attention forward via Triton kernel.
+
+        Args:
+            hidden_states: ``(B, S, d_model)``
+            mask:          ``(B, 1, S, S)`` additive attention mask
+            encoder_states: unused (self-attention only)
+            position_ids:  ``(B, S)`` integer position indices
+            output_attentions: unused (Triton path does not return weights)
+        """
+        assert position_ids is not None, "position_ids must be provided for RoPEFusedMHA"
+        B, S, _ = hidden_states.shape
+        H, D = self.n_heads, self.kv_proj_dim
+
+        q = self.q(hidden_states).view(B, S, H, D).transpose(1, 2).contiguous()  # (B, H, S, D)
+        k = self.k(hidden_states).view(B, S, H, D).transpose(1, 2).contiguous()
+        v = self.v(hidden_states).view(B, S, H, D).transpose(1, 2).contiguous()
+
+        if position_ids.shape[0] == 1 and B > 1:
+            position_ids = position_ids.expand(B, -1)
+
+        # The Triton kernel indexes the mask as (B, 1, S, S) using raw strides.
+        # The model passes a (B, 1, 1, S) broadcast mask, so expand it to the
+        # full square shape before handing off to the kernel.
+        if mask.shape[2] != S:
+            mask = mask.expand(B, 1, S, S)
+
+        attn_out = triton_fused_rope_attention(
+            q, k, v, mask.contiguous(), self.inv_freq.to(hidden_states.device)
+        )
+        attn_out = attn_out.transpose(1, 2).reshape(B, S, self.inner_dim)
+        return AttentionOutput(hidden_states=self.o(attn_out), attn_weights=None)
