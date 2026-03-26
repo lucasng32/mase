@@ -44,6 +44,7 @@ from .layers import AttentionOutput
 from .triton_grouped_attn import is_triton_available, triton_grouped_attention
 from .triton_bucketed_attn import BucketedPartition, triton_bucketed_attention
 from .triton_stitched_attn import StitchedPartition, triton_stitched_attention
+from .triton_specialized_attn import SpecializedPartition, triton_specialized_attention
 
 logger = logging.getLogger(__name__)
 
@@ -85,8 +86,9 @@ def compute_groups(group_ids: torch.Tensor) -> list[torch.Tensor]:
 # Kernel variant selection
 # ═══════════════════════════════════════════════════════════════════════════════
 class KernelVariant(Enum):
-    TRITON_STITCHED = auto()   # stitched tiles for small groups + bucketed for large
-    TRITON_BUCKETED = auto()   # original: one bucket per power-of-2 size (no stitching)
+    TRITON_SPECIALIZED = auto()  # G_SIZE-constexpr kernels for large groups + stitched for small
+    TRITON_STITCHED = auto()     # stitched tiles for small groups + bucketed for large
+    TRITON_BUCKETED = auto()     # original: one bucket per power-of-2 size (no stitching)
     TRITON = auto()
     PACKED_SPARSE = auto()
 
@@ -104,7 +106,7 @@ class KernelDispatcher:
             device: target device.
         """
         if device.type == "cuda" and is_triton_available():
-            return KernelVariant.TRITON_STITCHED
+            return KernelVariant.TRITON_SPECIALIZED
         return KernelVariant.PACKED_SPARSE
 
 
@@ -180,7 +182,9 @@ class GroupAwareMHA(nn.Module):
         self._partition = partition
         self._variant = variant or KernelVariant.PACKED_SPARSE
 
-        if self._variant == KernelVariant.TRITON_STITCHED:
+        if self._variant == KernelVariant.TRITON_SPECIALIZED:
+            self._precompute_specialized_triton_buffers(partition)
+        elif self._variant == KernelVariant.TRITON_STITCHED:
             self._precompute_stitched_triton_buffers(partition)
         elif self._variant == KernelVariant.TRITON_BUCKETED:
             self._precompute_bucketed_triton_buffers(partition)
@@ -223,6 +227,18 @@ class GroupAwareMHA(nn.Module):
         for label, members in enumerate(partition.groups):
             group_ids[members] = label
         return group_ids
+
+    def _precompute_specialized_triton_buffers(self, partition: GroupPartition) -> None:
+        """Build the SpecializedPartition and register sort/unsort permutations."""
+        group_ids = self._group_ids_from_partition(partition)
+        sp = SpecializedPartition.from_group_ids(group_ids)
+        self._specialized_partition = sp
+        self.register_buffer(
+            "_specialized_sort_perm", sp.global_sort_perm, persistent=False
+        )
+        self.register_buffer(
+            "_specialized_unsort_perm", sp.global_unsort_perm, persistent=False
+        )
 
     def _precompute_bucketed_triton_buffers(self, partition: GroupPartition) -> None:
         """Build the BucketedPartition and register sort/unsort permutations.
@@ -307,7 +323,9 @@ class GroupAwareMHA(nn.Module):
             mask: group-time additive mask from the model; not used at runtime
                 by the optimised paths (group structure is baked into buffers).
         """
-        if self._variant == KernelVariant.TRITON_STITCHED:
+        if self._variant == KernelVariant.TRITON_SPECIALIZED:
+            attn_out = self._forward_specialized_triton(hidden_states)
+        elif self._variant == KernelVariant.TRITON_STITCHED:
             attn_out = self._forward_stitched_triton(hidden_states)
         elif self._variant == KernelVariant.TRITON_BUCKETED:
             attn_out = self._forward_bucketed_triton(hidden_states)
@@ -351,6 +369,31 @@ class GroupAwareMHA(nn.Module):
         out = out[:, self._unsort_perm, :]
 
         return self.o(out)
+
+    def _forward_specialized_triton(self, x: torch.Tensor) -> torch.Tensor:
+        """G_SIZE-constexpr dispatch — stitched for small groups, specialized for large."""
+        T, B, d = x.shape
+        H, D = self.n_heads, self.kv_proj_dim
+
+        q = self.q(x).view(T, B, H, D)
+        k = self.k(x).view(T, B, H, D)
+        v = self.v(x).view(T, B, H, D)
+
+        q_s = q[:, self._specialized_sort_perm, :, :].permute(0, 2, 1, 3).contiguous()
+        k_s = k[:, self._specialized_sort_perm, :, :].permute(0, 2, 1, 3).contiguous()
+        v_s = v[:, self._specialized_sort_perm, :, :].permute(0, 2, 1, 3).contiguous()
+
+        sp = self._specialized_partition
+        if sp.stitched is not None:
+            st = sp.stitched
+            st.tile_seq_starts = st.tile_seq_starts.to(x.device)
+            st.tile_seq_counts = st.tile_seq_counts.to(x.device)
+            st.tile_group_labels = st.tile_group_labels.to(x.device)
+
+        out = triton_specialized_attention(q_s, k_s, v_s, sp, scale=1.0)
+
+        out = out.permute(0, 2, 1, 3).reshape(T, B, -1)
+        return self.o(out[:, self._specialized_unsort_perm, :])
 
     def _forward_stitched_triton(self, x: torch.Tensor) -> torch.Tensor:
         """Stitched-tile Triton dispatch — small groups bin-packed, large groups bucketed."""
