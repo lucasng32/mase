@@ -57,13 +57,9 @@ def test_get_hf_input_names_for_timeseries():
     input_names = get_hf_input_names(_model_info(), "forecasting")
     assert input_names == [
         "context",
-        "context_mask",
         "group_ids",
         "future_covariates",
-        "future_covariates_mask",
         "num_output_patches",
-        "future_target",
-        "future_target_mask",
     ]
 
 

@@ -81,18 +81,15 @@ def get_hf_input_names(model_info, task: str) -> list[str] | None:
 
     match task:
         case "forecasting":
-            # The generic MASE training/transform path should trace the full
-            # forecasting signature so quantized GraphModules can still be used
-            # in fine-tuning or evaluation code paths.
+            # Trace the same inference-safe Chronos2 signature used by the
+            # working notebook workflow. Including future_target forces the
+            # model through its loss path, which currently hits FX-unfriendly
+            # control flow in _compute_loss.
             return [
                 "context",
-                "context_mask",
                 "group_ids",
                 "future_covariates",
-                "future_covariates_mask",
                 "num_output_patches",
-                "future_target",
-                "future_target_mask",
             ]
         case _:
             raise ValueError(f"Task {task} is not supported for {model_info.name}")
