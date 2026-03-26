@@ -1,6 +1,0 @@
-model_name,win_rate,skill_score,median_training_time_s_per100,median_inference_time_s_per100,training_corpus_overlap,num_failures
-fp32_chronos2,95.75,35.0322142580807,,0.31422619046289973,0.0,0
-Chronos-Bolt,67.5,26.51514785224567,0.0,0.24851168673039045,0.0,0
-spectral_ptq_chronos2,50.99999999999999,5.4874931436741825,,0.4786915438760413,0.0,0
-Seasonal Naive,31.0,0.0,0.0,0.455576268872549,0.0,0
-baseline_ptq_chronos2,4.75,-78.9625858813255,,0.5333928571694524,0.0,0
