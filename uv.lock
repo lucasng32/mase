@@ -1099,6 +1099,17 @@ wheels = [
 ]
 
 [[package]]
+name = "flashinfer-python"
+version = "0.2.5+cu126torch2.6"
+source = { registry = "https://flashinfer.ai/whl/cu126/torch2.6/" }
+dependencies = [
+    { name = "torch" },
+]
+wheels = [
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.2.5/flashinfer_python-0.2.5+cu126torch2.6-cp38-abi3-linux_x86_64.whl", hash = "sha256:d3c1c897644850124eb45fedc1d68ac2f05175c3d330d71f0370bb231c3ef0d3" },
+]
+
+[[package]]
 name = "flatbuffers"
 version = "25.9.23"
 source = { registry = "https://pypi.org/simple" }
@@ -2221,6 +2232,7 @@ dependencies = [
     { name = "emoji" },
     { name = "evaluate" },
     { name = "fev" },
+    { name = "flashinfer-python" },
     { name = "ghp-import" },
     { name = "gitpython" },
     { name = "h5py" },
@@ -2304,6 +2316,7 @@ requires-dist = [
     { name = "emoji" },
     { name = "evaluate", specifier = "==0.4.3" },
     { name = "fev", specifier = ">=0.7.0" },
+    { name = "flashinfer-python", specifier = ">=0.2.5" },
     { name = "ghp-import" },
     { name = "gitpython" },
     { name = "h5py" },
