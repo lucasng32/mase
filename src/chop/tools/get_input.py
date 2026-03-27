@@ -1,6 +1,8 @@
 import inspect
+import math
 from typing import Literal
 from enum import Enum
+import torch
 
 
 class ModelSource(Enum):
@@ -59,9 +61,70 @@ def get_cf_args(model_info, task: str, model):
         for required_input_arg in required_input_args:
             all_forward_kwargs.pop(required_input_arg)
         cf_args = all_forward_kwargs
+    elif model_info.is_timeseries_model:
+        match task:
+            case "forecasting":
+                required_input_args = ["context"]
+            case _:
+                raise ValueError(f"Task {task} is not supported for {model_info.name}")
+        for required_input_arg in required_input_args:
+            all_forward_kwargs.pop(required_input_arg, None)
+        cf_args = all_forward_kwargs
     else:
         raise RuntimeError(f"Unsupported model+task: {model_info.name}+{task}")
     return cf_args
+
+
+def get_hf_input_names(model_info, task: str) -> list[str] | None:
+    if not model_info.is_timeseries_model:
+        return None
+
+    match task:
+        case "forecasting":
+            # Trace the same inference-safe Chronos2 signature used by the
+            # working notebook workflow. Including future_target forces the
+            # model through its loss path, which currently hits FX-unfriendly
+            # control flow in _compute_loss.
+            return [
+                "context",
+                "group_ids",
+                "future_covariates",
+                "num_output_patches",
+            ]
+        case _:
+            raise ValueError(f"Task {task} is not supported for {model_info.name}")
+
+
+def _get_timeseries_output_patch_size(model) -> int:
+    if model is not None and hasattr(model, "chronos_config"):
+        return int(model.chronos_config.output_patch_size)
+    return 16
+
+
+def _format_timeseries_inputs(input_dict: dict, model=None, device: str = "meta") -> dict:
+    past_values = input_dict["past_values"].to(device)
+    future_values = input_dict["future_values"].to(device)
+    output_patch_size = _get_timeseries_output_patch_size(model)
+    num_output_patches = max(1, math.ceil(future_values.shape[-1] / output_patch_size))
+
+    return {
+        "context": past_values,
+        "context_mask": torch.ones_like(past_values, dtype=torch.bool, device=device),
+        "group_ids": torch.zeros((past_values.shape[0],), dtype=torch.long, device=device),
+        "future_covariates": torch.zeros(
+            (past_values.shape[0], num_output_patches * output_patch_size),
+            dtype=past_values.dtype,
+            device=device,
+        ),
+        "future_covariates_mask": torch.zeros(
+            (past_values.shape[0], num_output_patches * output_patch_size),
+            dtype=torch.bool,
+            device=device,
+        ),
+        "future_target": future_values,
+        "future_target_mask": torch.ones_like(future_values, dtype=torch.bool, device=device),
+        "num_output_patches": num_output_patches,
+    }
 
 
 def get_dummy_input(
@@ -69,6 +132,7 @@ def get_dummy_input(
     data_module,
     task: str,
     device: str = "meta",
+    model=None,
 ) -> dict:
     """Create a single dummy input for a model. The dummy input is a single sample from the training set.
 
@@ -163,6 +227,17 @@ def get_dummy_input(
                 }
             case _:
                 raise ValueError(f"Task {task} is not supported for {model_info.name}")
+    elif model_info.is_timeseries_model:
+        match task:
+            case "forecasting":
+                input_dict = next(train_iter)
+                single_input = {
+                    "past_values": input_dict["past_values"][[sample_index], ...],
+                    "future_values": input_dict["future_values"][[sample_index], ...],
+                }
+                dummy_inputs = _format_timeseries_inputs(single_input, model=model, device=device)
+            case _:
+                raise ValueError(f"Task {task} is not supported for {model_info.name}")
     else:
         raise RuntimeError(f"Unsupported model+task: {model_info.name}+{task}")
 
@@ -177,6 +252,7 @@ class InputGenerator:
         task: str,
         which_dataloader: Literal["train", "val", "test"],
         max_batches: int = None,
+        model=None,
     ) -> None:
         """
         Input generator for feeding batches to models. This is used for software passes.
@@ -193,6 +269,7 @@ class InputGenerator:
         ), "DataModule is not setup. Please call data_module.prepare_data() and .setup()."
         self.model_info = model_info
         self.task = task
+        self.model = model
 
         self.batch_size = data_module.batch_size
         self.dataloader = getattr(data_module, f"{which_dataloader}_dataloader")()
@@ -255,6 +332,15 @@ class InputGenerator:
                         "decoder_input_ids": input_dict["decoder_input_ids"],
                         "decoder_attention_mask": input_dict["decoder_attention_mask"],
                     }
+                case _:
+                    raise ValueError(
+                        f"Task {self.task} is not supported for {self.model_info.name}"
+                    )
+        elif self.model_info.is_timeseries_model:
+            match self.task:
+                case "forecasting":
+                    batch = next(self.dataloader_iter)
+                    inputs = _format_timeseries_inputs(batch, model=self.model, device=batch["past_values"].device)
                 case _:
                     raise ValueError(
                         f"Task {self.task} is not supported for {self.model_info.name}"

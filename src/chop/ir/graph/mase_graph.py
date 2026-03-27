@@ -208,6 +208,22 @@ def trace_torch_module(
             graph_module.patched_custom_layers = []
             graph_module.additional_inputs = {}
 
+    if isinstance(model, torch.nn.Module):
+        for attr in (
+            "class_for_deserialization",
+            "config",
+            "chronos_config",
+            "num_quantiles",
+        ):
+            if hasattr(model, attr):
+                setattr(graph_module, attr, getattr(model, attr))
+
+        if not hasattr(graph_module, "class_for_deserialization"):
+            graph_module.class_for_deserialization = model.__class__
+
+        if hasattr(model, "device"):
+            graph_module.device = model.device
+
     return graph_module
 
 
