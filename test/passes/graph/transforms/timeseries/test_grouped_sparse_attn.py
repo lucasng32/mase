@@ -151,10 +151,17 @@ class TestKernelDispatcher:
         assert KernelDispatcher.select(p, torch.device("cpu")) == KernelVariant.PACKED_SPARSE
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_cuda_selects_triton_bucketed(self):
+    def test_cuda_selects_triton_variant(self):
         p = GroupPartition.from_group_ids(torch.tensor([0, 0, 1, 1]))
         variant = KernelDispatcher.select(p, torch.device("cuda"))
-        assert variant in (KernelVariant.TRITON_BUCKETED, KernelVariant.PACKED_SPARSE)
+        triton_variants = (
+            KernelVariant.TRITON_SPECIALIZED,
+            KernelVariant.TRITON_STITCHED,
+            KernelVariant.TRITON_BUCKETED,
+            KernelVariant.TRITON,
+            KernelVariant.PACKED_SPARSE,
+        )
+        assert variant in triton_variants
 
 
 # ---------------------------------------------------------------------------
@@ -246,31 +253,27 @@ class TestOutputProperties:
         mha = GroupAwareMHA(small_config, partition, variant=KernelVariant.PACKED_SPARSE)
         assert mha._variant == KernelVariant.PACKED_SPARSE
 
-    def test_swap_only_touches_group_self_attention(self, small_config):
-        """Replacing GroupSelfAttention.self_attention must not affect
-        the MHA inside TimeSelfAttention — they are distinct objects."""
-        group_attn = GroupSelfAttention(small_config)
-        time_attn = TimeSelfAttention(small_config)
+    def test_swap_only_touches_group_self_attention(self, small_model):
+        """The pass must swap GroupSelfAttention.self_attention to GroupAwareMHA
+        and leave TimeSelfAttention.self_attention as plain MHA."""
+        mg = _build_mg(small_model)
+        mg, _ = fast_group_attention_transform_pass(mg, pass_args={"group_ids": torch.arange(8) // 2})
+        optimized = mg.model
 
-        original_time_mha = time_attn.self_attention
-        original_group_mha = group_attn.self_attention
+        group_attns = [m for m in optimized.modules() if isinstance(m, GroupSelfAttention)]
+        time_attns = [m for m in optimized.modules() if isinstance(m, TimeSelfAttention)]
 
-        # Simulate what the MASE pass does: swap the inner MHA of GroupSelfAttention
-        partition = GroupPartition.from_group_ids(torch.tensor([0, 0, 1, 1]))
-        group_aware = GroupAwareMHA(small_config, partition, variant=KernelVariant.PACKED_SPARSE)
-        group_aware.load_state_dict(group_attn.self_attention.state_dict())
-        group_attn.self_attention = group_aware
+        assert group_attns, "No GroupSelfAttention found in optimized model"
+        assert time_attns, "No TimeSelfAttention found in optimized model"
 
-        # GroupSelfAttention now has GroupAwareMHA
-        assert isinstance(group_attn.self_attention, GroupAwareMHA)
-
-        # TimeSelfAttention.self_attention is completely untouched
-        assert time_attn.self_attention is original_time_mha
-        assert isinstance(time_attn.self_attention, MHA)
-        assert not isinstance(time_attn.self_attention, GroupAwareMHA)
-
-        # The original GroupSelfAttention MHA is also a different object
-        assert group_attn.self_attention is not original_group_mha
+        for m in group_attns:
+            assert isinstance(m.self_attention, GroupAwareMHA), (
+                f"GroupSelfAttention.self_attention is {type(m.self_attention)}, expected GroupAwareMHA"
+            )
+        for m in time_attns:
+            assert isinstance(m.self_attention, MHA) and not isinstance(m.self_attention, GroupAwareMHA), (
+                f"TimeSelfAttention.self_attention was unexpectedly changed to {type(m.self_attention)}"
+            )
 
 
 # ---------------------------------------------------------------------------

@@ -106,7 +106,7 @@ class KernelDispatcher:
             device: target device.
         """
         if device.type == "cuda" and is_triton_available():
-            return KernelVariant.TRITON_SPECIALIZED
+            return KernelVariant.TRITON_STITCHED
         return KernelVariant.PACKED_SPARSE
 
 
